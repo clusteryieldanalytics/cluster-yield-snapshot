@@ -1,0 +1,47 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "cluster-yield-snapshot"
+version = "0.3.0"
+description = "Capture Spark plans, config, and table metadata for Cluster Yield analysis"
+readme = "README.md"
+license = "Apache-2.0"
+requires-python = ">=3.9"
+authors = [{ name = "Cluster Yield" }]
+keywords = ["spark", "databricks", "optimization", "query-plan"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Topic :: Database",
+    "Topic :: Software Development :: Quality Assurance",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+
+# Zero mandatory dependencies — pyspark is the runtime environment
+dependencies = []
+
+[project.optional-dependencies]
+upload = ["httpx>=0.24"]
+dev = [
+    "pytest>=7",
+    "pytest-cov",
+    "pyspark>=3.3",
+    "httpx>=0.24",
+]
+
+[project.urls]
+Homepage = "https://clusteryield.com"
+Documentation = "https://docs.clusteryield.com/snapshot"
+Repository = "https://github.com/clusteryieldanalytics/cluster-yield"
+
+[tool.hatch.build.targets.wheel]
+packages = ["cluster_yield_snapshot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
