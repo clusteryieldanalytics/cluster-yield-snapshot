@@ -25,6 +25,17 @@ if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
 
+# SQL statement prefixes that produce trivial or no-op plans.
+# These are DDL, metadata, and session commands — never interesting.
+_SKIP_SQL_PREFIXES = (
+    "DROP ", "CREATE ", "ALTER ", "TRUNCATE ",
+    "DESCRIBE ", "SHOW ", "SET ", "RESET ", "USE ",
+    "GRANT ", "REVOKE ", "DENY ",
+    "MSCK ", "REFRESH ", "CACHE ", "UNCACHE ", "CLEAR ",
+    "ADD ", "LIST ",
+    "EXPLAIN ",
+)
+
 # DataFrame action methods that trigger execution.
 # We capture the plan AFTER the action returns so we get the
 # post-AQE executed plan on classic PySpark.
@@ -96,6 +107,10 @@ class PassiveCapture:
         # for a single notebook session.
         self._sql_texts: dict[int, str] = {}
 
+        # Actual runtime classes (set during patching, used for restore)
+        self._df_class: Optional[type] = None
+        self._writer_class: Optional[type] = None
+
     @property
     def active(self) -> bool:
         return self._active
@@ -104,6 +119,10 @@ class PassiveCapture:
         """Start capturing. Patches SparkSession and DataFrame classes."""
         if self._active:
             return self
+        # Detect runtime classes BEFORE any patching, so the probe
+        # query doesn't get captured by our own hooks.
+        self._df_class = self._detect_dataframe_class()
+        self._writer_class = self._detect_writer_class()
         self._patch_spark_sql()
         self._patch_dataframe_actions()
         self._patch_writer_actions()
@@ -140,6 +159,10 @@ class PassiveCapture:
     def _on_sql_called(self, sql_text: str, df: DataFrame) -> None:
         """Called when spark.sql() is invoked. Captures the plan."""
         try:
+            # Skip DDL and metadata queries — they produce trivial plans
+            if self._should_skip_sql(sql_text):
+                return
+
             self._enter_capture()
             self._counter += 1
             # Store SQL text so action-time capture can use it as label
@@ -158,9 +181,8 @@ class PassiveCapture:
 
     def _patch_dataframe_actions(self) -> None:
         """Patch DataFrame action methods to capture post-execution plans."""
-        try:
-            from pyspark.sql import DataFrame as DFClass
-        except ImportError:
+        DFClass = self._df_class
+        if DFClass is None:
             return
 
         for method_name in _ACTION_METHODS:
@@ -208,9 +230,8 @@ class PassiveCapture:
 
     def _patch_writer_actions(self) -> None:
         """Patch DataFrameWriter write methods to capture write plans."""
-        try:
-            from pyspark.sql import DataFrameWriter as WriterClass
-        except ImportError:
+        WriterClass = self._writer_class
+        if WriterClass is None:
             return
 
         for method_name in _WRITER_METHODS:
@@ -279,16 +300,58 @@ class PassiveCapture:
                 if key == "spark.sql":
                     self._spark.sql = original
                 elif key.startswith("DataFrame."):
-                    from pyspark.sql import DataFrame as DFClass
-                    method_name = key.split(".", 1)[1]
-                    setattr(DFClass, method_name, original)
+                    # Use the stored runtime class, not the import
+                    cls = getattr(self, "_df_class", None)
+                    if cls is not None:
+                        method_name = key.split(".", 1)[1]
+                        setattr(cls, method_name, original)
                 elif key.startswith("DataFrameWriter."):
-                    from pyspark.sql import DataFrameWriter as WriterClass
-                    method_name = key.split(".", 1)[1]
-                    setattr(WriterClass, method_name, original)
+                    cls = getattr(self, "_writer_class", None)
+                    if cls is not None:
+                        method_name = key.split(".", 1)[1]
+                        setattr(cls, method_name, original)
             except Exception:
                 pass
         self._originals.clear()
+
+    # ── Runtime class detection ──────────────────────────────────────────
+
+    def _detect_dataframe_class(self) -> Optional[type]:
+        """
+        Detect the actual DataFrame class used at runtime.
+
+        On classic PySpark: pyspark.sql.dataframe.DataFrame
+        On Spark Connect:   pyspark.sql.connect.dataframe.DataFrame
+        On Databricks:      may be either, depending on cluster type
+
+        We probe with a real query because the import path
+        `from pyspark.sql import DataFrame` always returns the classic
+        class, even when Connect is active.
+        """
+        try:
+            probe = self._spark.sql("SELECT 1")
+            return type(probe)
+        except Exception:
+            pass
+        # Fallback to import
+        try:
+            from pyspark.sql import DataFrame
+            return DataFrame
+        except ImportError:
+            return None
+
+    def _detect_writer_class(self) -> Optional[type]:
+        """Detect the actual DataFrameWriter class used at runtime."""
+        try:
+            probe = self._spark.sql("SELECT 1")
+            return type(probe.write)
+        except Exception:
+            pass
+        try:
+            from pyspark.sql import DataFrameWriter
+            return DataFrameWriter
+        except ImportError:
+            return None
 
     # ── Re-entrancy guard ────────────────────────────────────────────────
 
@@ -300,6 +363,35 @@ class PassiveCapture:
 
     def _exit_capture(self) -> None:
         self._inside_capture.flag = False
+
+    # ── Filtering ─────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _should_skip_sql(sql_text: str) -> bool:
+        """
+        Return True for SQL that produces trivial or no-op plans.
+
+        DDL (DROP, CREATE, ALTER), metadata (DESCRIBE, SHOW),
+        and session commands (SET, USE) are never interesting
+        for plan analysis.
+        """
+        stripped = sql_text.strip().upper()
+        # Handle multi-line SQL — check the first non-empty keyword
+        # Also handle comments: skip leading -- or /* ... */
+        for line in stripped.split("\n"):
+            line = line.strip()
+            if not line or line.startswith("--"):
+                continue
+            # Strip block comments at start
+            while line.startswith("/*"):
+                end = line.find("*/")
+                if end == -1:
+                    break
+                line = line[end + 2:].strip()
+            if not line:
+                continue
+            return line.startswith(_SKIP_SQL_PREFIXES)
+        return False
 
     # ── Label helpers ────────────────────────────────────────────────────
 

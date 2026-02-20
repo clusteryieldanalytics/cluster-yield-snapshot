@@ -101,6 +101,13 @@ def _setup_mock_pyspark():
     mock_pyspark = types.ModuleType("pyspark")
     mock_sql = types.ModuleType("pyspark.sql")
 
+    class MockDataFrameWriter:
+        def __init__(self, df=None):
+            self._df = df
+        def save(self, path=None, **kw): pass
+        def parquet(self, path, **kw): pass
+        def csv(self, path, **kw): pass
+
     class MockDataFrame:
         def collect(self): return []
         def count(self): return 0
@@ -111,12 +118,9 @@ def _setup_mock_pyspark():
         def take(self, n): return []
         def tail(self, n): return []
 
-    class MockDataFrameWriter:
-        def __init__(self, df):
-            self._df = df
-        def save(self, path=None, **kw): pass
-        def parquet(self, path, **kw): pass
-        def csv(self, path, **kw): pass
+        @property
+        def write(self):
+            return MockDataFrameWriter(self)
 
     mock_sql.DataFrame = MockDataFrame
     mock_sql.DataFrameWriter = MockDataFrameWriter
@@ -169,6 +173,7 @@ def test_passive_capture_patches_dataframe_actions():
     MockDF, _ = _setup_mock_pyspark()
     try:
         mock_spark = MagicMock()
+        mock_spark.sql = MagicMock(return_value=MockDF())
         original_collect = MockDF.collect
 
         captured = []
@@ -198,6 +203,7 @@ def test_passive_capture_patches_writer():
     MockDF, MockWriter = _setup_mock_pyspark()
     try:
         mock_spark = MagicMock()
+        mock_spark.sql = MagicMock(return_value=MockDF())
         original_parquet = MockWriter.parquet
 
         captured = []

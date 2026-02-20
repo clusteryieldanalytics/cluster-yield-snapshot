@@ -24,6 +24,20 @@ GENERIC_COLUMNS = frozenset({
 })
 
 
+def _quote_name(table_name: str) -> str:
+    """
+    Quote a possibly-qualified table name for SQL.
+
+    'workspace.test_cy.orders' → '`workspace`.`test_cy`.`orders`'
+    'orders'                   → '`orders`'
+
+    Each segment is quoted separately so Unity Catalog resolves
+    catalog.schema.table correctly.
+    """
+    parts = table_name.replace("`", "").split(".")
+    return ".".join(f"`{p}`" for p in parts)
+
+
 def get_table_stats(spark: SparkSession, table_name: str) -> Optional[dict[str, Any]]:
     """
     Extract table statistics using multiple strategies.
@@ -56,7 +70,7 @@ def _try_describe_detail(spark: SparkSession, table_name: str) -> dict[str, Any]
     """Try DESCRIBE DETAIL (Delta / Databricks) for table stats."""
     stats: dict[str, Any] = {}
     try:
-        detail = spark.sql(f"DESCRIBE DETAIL `{table_name}`").collect()
+        detail = spark.sql(f"DESCRIBE DETAIL {_quote_name(table_name)}").collect()
         if not detail:
             return stats
         rd = detail[0].asDict()
@@ -90,7 +104,7 @@ def _try_describe_detail(spark: SparkSession, table_name: str) -> dict[str, Any]
 def _get_row_count(spark: SparkSession, table_name: str) -> dict[str, Any]:
     """Try to get row count cheaply (without a full COUNT(*))."""
     try:
-        props = spark.sql(f"SHOW TBLPROPERTIES `{table_name}`").collect()
+        props = spark.sql(f"SHOW TBLPROPERTIES {_quote_name(table_name)}").collect()
         for row in props:
             rd = row.asDict()
             key = rd.get("key", "")
@@ -108,7 +122,7 @@ def _get_row_count(spark: SparkSession, table_name: str) -> dict[str, Any]:
 def get_partition_columns(spark: SparkSession, table_name: str) -> list[str]:
     """Extract partition columns via DESCRIBE EXTENDED."""
     try:
-        rows = spark.sql(f"DESCRIBE EXTENDED `{table_name}`").collect()
+        rows = spark.sql(f"DESCRIBE EXTENDED {_quote_name(table_name)}").collect()
         in_partition_section = False
         columns: list[str] = []
         for row in rows:
