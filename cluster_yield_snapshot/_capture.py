@@ -36,6 +36,13 @@ _SKIP_SQL_PREFIXES = (
     "EXPLAIN ",
 )
 
+# Exact SQL statements to skip (probes, health checks)
+_SKIP_SQL_EXACT = frozenset({
+    "SELECT 1",
+    "SELECT 1 AS _",
+    "SELECT CURRENT_VERSION()",
+})
+
 # DataFrame action methods that trigger execution.
 # We capture the plan AFTER the action returns so we get the
 # post-AQE executed plan on classic PySpark.
@@ -372,13 +379,19 @@ class PassiveCapture:
         Return True for SQL that produces trivial or no-op plans.
 
         DDL (DROP, CREATE, ALTER), metadata (DESCRIBE, SHOW),
-        and session commands (SET, USE) are never interesting
-        for plan analysis.
+        session commands (SET, USE), and known probes (SELECT 1)
+        are never interesting for plan analysis.
         """
-        stripped = sql_text.strip().upper()
+        stripped = sql_text.strip()
+        upper = stripped.upper()
+
+        # Exact matches (probes, health checks)
+        if upper in _SKIP_SQL_EXACT:
+            return True
+
         # Handle multi-line SQL — check the first non-empty keyword
         # Also handle comments: skip leading -- or /* ... */
-        for line in stripped.split("\n"):
+        for line in upper.split("\n"):
             line = line.strip()
             if not line or line.startswith("--"):
                 continue

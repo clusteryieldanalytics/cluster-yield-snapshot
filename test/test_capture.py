@@ -154,11 +154,11 @@ def test_passive_capture_patches_spark_sql():
         assert mock_spark.sql is not original_sql
 
         # Call the patched version
-        mock_spark.sql("SELECT 1")
+        mock_spark.sql("SELECT * FROM orders")
         assert original_sql.called
         assert len(captured) == 1
-        assert "SELECT 1" in captured[0][0]
-        assert captured[0][1] == "SELECT 1"
+        assert "SELECT * FROM orders" in captured[0][0]
+        assert captured[0][1] == "SELECT * FROM orders"
         assert captured[0][2] == "spark.sql"
 
         pc.stop()
@@ -300,7 +300,7 @@ def test_passive_capture_callback_exception_doesnt_break():
         pc.start()
 
         # This should NOT raise — the exception is swallowed
-        result = mock_spark.sql("SELECT 1")
+        result = mock_spark.sql("SELECT * FROM orders")
         assert result is not None  # original return value passes through
 
         pc.stop()

@@ -41,7 +41,7 @@ from .upload import upload_snapshot, upload_snapshot_urllib, UploadResult, Uploa
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
-VERSION = "0.3.3"
+VERSION = "0.3.5"
 
 
 class CYSnapshot:
@@ -100,6 +100,11 @@ class CYSnapshot:
         # We keep the later capture (post-AQE) and drop the earlier one.
         self._fingerprints: dict[str, int] = {}  # fingerprint -> index in _plans
 
+        # Secondary dedup by normalized SQL text. Catches duplicates where
+        # the same query produces slightly different plan fingerprints
+        # (e.g. different column reference IDs on Connect).
+        self._sql_hashes: dict[str, int] = {}  # sql_hash -> index in _plans
+
         if not quiet:
             print(f"[CY] Snapshot initialized — Spark {spark.version}")
 
@@ -154,6 +159,10 @@ class CYSnapshot:
                   f"{len(self._catalog_tables)} tables cataloged")
         return self
 
+    # Minimum plan nodes to keep. Plans with fewer nodes are trivial
+    # (e.g. empty DDL results, single-node metadata queries).
+    _MIN_PLAN_NODES = 2
+
     def _on_plan_captured(
         self,
         label: str,
@@ -170,35 +179,54 @@ class CYSnapshot:
             self._invalidate_cache()
             entry = _plans.capture_plan(df, label, sql=sql)
             entry["trigger"] = trigger
+            nodes = entry.get("nodeCount", 0)
             fp = entry.get("fingerprint", "")
 
-            # Dedup: if we already have a plan with this fingerprint
-            # (e.g. from spark.sql() time), replace it with this one
-            # (which may be post-AQE from action time).
-            if fp and fp != "empty" and fp in self._fingerprints:
+            # ── Filter: skip trivial plans ────────────────────────────
+            if nodes < self._MIN_PLAN_NODES:
+                return
+
+            # ── Filter: skip empty fingerprints (failed extraction) ───
+            if not fp or fp == "empty":
+                return
+
+            # ── Dedup by fingerprint ──────────────────────────────────
+            if fp in self._fingerprints:
                 idx = self._fingerprints[fp]
                 old_trigger = self._plans[idx].get("trigger", "")
-                # Prefer action/write captures over spark.sql captures
-                # because they reflect the post-AQE executed plan
                 if old_trigger == "spark.sql" and trigger != "spark.sql":
-                    # Keep the better label/SQL from the spark.sql entry
                     old_sql = self._plans[idx].get("sql")
                     if old_sql and not entry.get("sql"):
                         entry["sql"] = old_sql
                         entry["label"] = self._plans[idx]["label"]
                     self._plans[idx] = entry
-                    self._log(f"  ↻ Updated '{entry['label']}' "
+                    self._log(f"  ↻ Updated '{entry['label'][:60]}' "
                               f"with post-execution plan [{trigger}]")
-                    return
-                # Same trigger type — skip the duplicate
                 return
 
+            # ── Dedup by SQL text (catches Connect column-ID drift) ───
+            sql_hash = self._sql_hash(sql)
+            if sql_hash and sql_hash in self._sql_hashes:
+                idx = self._sql_hashes[sql_hash]
+                old_trigger = self._plans[idx].get("trigger", "")
+                if old_trigger == "spark.sql" and trigger != "spark.sql":
+                    entry["sql"] = sql or self._plans[idx].get("sql")
+                    entry["label"] = self._plans[idx].get("label", label)
+                    self._plans[idx] = entry
+                    self._fingerprints[fp] = idx
+                    self._log(f"  ↻ Updated '{entry['label'][:60]}' "
+                              f"with post-execution plan [{trigger}]")
+                return
+
+            # ── Store the plan ────────────────────────────────────────
+            idx = len(self._plans)
             self._plans.append(entry)
-            self._fingerprints[fp] = len(self._plans) - 1
+            self._fingerprints[fp] = idx
+            if sql_hash:
+                self._sql_hashes[sql_hash] = idx
 
             mode = entry.get("planFormat", "?")
-            nodes = entry.get("nodeCount", 0)
-            self._log(f"  ✓ Captured '{label}' — "
+            self._log(f"  ✓ Captured '{label[:60]}' — "
                       f"{nodes} nodes [{mode}] ({trigger})")
         except Exception:
             pass  # Absolutely never break user code
@@ -415,6 +443,16 @@ class CYSnapshot:
 
     def _invalidate_cache(self) -> None:
         self._cached_snapshot = None
+
+    @staticmethod
+    def _sql_hash(sql: Optional[str]) -> Optional[str]:
+        """Normalize SQL and return a short hash for dedup."""
+        if not sql:
+            return None
+        import hashlib
+        # Normalize: collapse whitespace, lowercase
+        normalized = " ".join(sql.split()).lower()
+        return hashlib.sha256(normalized.encode()).hexdigest()[:16]
 
     def _record_error(self, phase: str, target: str, exception: Exception) -> None:
         msg = f"[{phase}] {target}: {type(exception).__name__}: {exception}"
