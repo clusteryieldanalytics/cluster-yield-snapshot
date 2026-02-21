@@ -41,7 +41,7 @@ from .upload import upload_snapshot, upload_snapshot_urllib, UploadResult, Uploa
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
-VERSION = "0.3.5"
+VERSION = "0.3.6"
 
 
 class CYSnapshot:
@@ -190,33 +190,52 @@ class CYSnapshot:
             if not fp or fp == "empty":
                 return
 
-            # ── Dedup by fingerprint ──────────────────────────────────
-            if fp in self._fingerprints:
-                idx = self._fingerprints[fp]
-                old_trigger = self._plans[idx].get("trigger", "")
-                if old_trigger == "spark.sql" and trigger != "spark.sql":
-                    old_sql = self._plans[idx].get("sql")
-                    if old_sql and not entry.get("sql"):
-                        entry["sql"] = old_sql
-                        entry["label"] = self._plans[idx]["label"]
-                    self._plans[idx] = entry
-                    self._log(f"  ↻ Updated '{entry['label'][:60]}' "
-                              f"with post-execution plan [{trigger}]")
-                return
+            # ── Dedup: only suppress true duplicates ──────────────────
+            # Two cases where we dedup:
+            #   1. Same SQL captured at spark.sql() time, then again at
+            #      action time → replace pre-AQE with post-AQE plan
+            #   2. Exact same SQL text fired twice (cell re-run, etc.)
+            #
+            # We do NOT dedup by fingerprint alone because different
+            # queries can produce the same operator sequence (e.g. two
+            # different 3-way joins both produce SMJ→Exchange→FileScan).
 
-            # ── Dedup by SQL text (catches Connect column-ID drift) ───
             sql_hash = self._sql_hash(sql)
+
+            # Case 1: SQL text match (most reliable)
             if sql_hash and sql_hash in self._sql_hashes:
                 idx = self._sql_hashes[sql_hash]
                 old_trigger = self._plans[idx].get("trigger", "")
                 if old_trigger == "spark.sql" and trigger != "spark.sql":
+                    # Upgrade pre-AQE → post-AQE
                     entry["sql"] = sql or self._plans[idx].get("sql")
                     entry["label"] = self._plans[idx].get("label", label)
                     self._plans[idx] = entry
                     self._fingerprints[fp] = idx
                     self._log(f"  ↻ Updated '{entry['label'][:60]}' "
                               f"with post-execution plan [{trigger}]")
-                return
+                return  # either upgraded or exact dup — don't add
+
+            # Case 2: Same fingerprint AND came from the same spark.sql()
+            # DataFrame (action on a DF we already captured at sql time).
+            # Only apply when old entry was spark.sql and new is action/write.
+            if fp in self._fingerprints:
+                idx = self._fingerprints[fp]
+                old_trigger = self._plans[idx].get("trigger", "")
+                old_sql = self._plans[idx].get("sql")
+                if old_trigger == "spark.sql" and trigger != "spark.sql":
+                    # This is the pre-AQE → post-AQE upgrade for SQL queries
+                    if old_sql and not entry.get("sql"):
+                        entry["sql"] = old_sql
+                        entry["label"] = self._plans[idx]["label"]
+                    self._plans[idx] = entry
+                    if sql_hash:
+                        self._sql_hashes[sql_hash] = idx
+                    self._log(f"  ↻ Updated '{entry['label'][:60]}' "
+                              f"with post-execution plan [{trigger}]")
+                    return
+                # Same fingerprint from two action triggers = different
+                # queries with same plan shape. Keep both! Fall through.
 
             # ── Store the plan ────────────────────────────────────────
             idx = len(self._plans)
