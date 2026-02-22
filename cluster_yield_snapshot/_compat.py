@@ -183,6 +183,18 @@ def _collect_metrics_recursive(
     """
     Walk the SparkPlan tree depth-first, extracting metrics from each node.
 
+    Handles AQE (Adaptive Query Execution) transparently:
+
+    - **AdaptiveSparkPlanExec**: The top-level wrapper when AQE is enabled
+      (default on Spark 3.2+ and all Databricks runtimes). Its ``.children()``
+      returns the *initial* plan where all metrics are zero.  We instead call
+      ``.executedPlan()`` on it to get the *final* plan with populated metrics.
+
+    - **QueryStageExec** variants (``ShuffleQueryStageExec``,
+      ``BroadcastQueryStageExec``): These wrap individual stages that AQE
+      materialized at runtime.  Their ``.plan()`` returns the underlying
+      executed plan for that stage, which carries the real metrics.
+
     Each node produces::
 
         {
@@ -195,14 +207,36 @@ def _collect_metrics_recursive(
     most nodes have many registered metrics that never fire.
     """
     try:
-        node_name = str(plan_node.nodeName())
-    except Exception:
-        node_name = "unknown"
-
-    try:
         class_name = str(plan_node.getClass().getSimpleName())
     except Exception:
-        class_name = node_name
+        class_name = "unknown"
+
+    # ── AQE unwrapping ────────────────────────────────────────────────
+    # AdaptiveSparkPlanExec.children() → initial plan (metrics = 0).
+    # AdaptiveSparkPlanExec.executedPlan → final plan (metrics populated).
+    if class_name == "AdaptiveSparkPlanExec":
+        try:
+            final_plan = plan_node.executedPlan()
+            _collect_metrics_recursive(final_plan, collector)
+            return
+        except Exception:
+            pass  # fall through to normal traversal
+
+    # QueryStageExec wraps a materialized stage.  .plan() has the real
+    # operators with metrics; the QueryStageExec itself is just a shell.
+    if "QueryStageExec" in class_name:
+        try:
+            stage_plan = plan_node.plan()
+            _collect_metrics_recursive(stage_plan, collector)
+            return
+        except Exception:
+            pass  # fall through to normal traversal
+
+    # ── Normal node processing ────────────────────────────────────────
+    try:
+        node_name = str(plan_node.nodeName())
+    except Exception:
+        node_name = class_name
 
     node_info: dict[str, Any] = {
         "nodeName": node_name,

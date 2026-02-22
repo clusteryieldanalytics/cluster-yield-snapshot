@@ -486,6 +486,104 @@ def test_collect_metrics_recursive_with_children():
     assert collector[1]["simpleClassName"] == "FilterExec"
 
 
+def test_collect_metrics_unwraps_aqe():
+    """AdaptiveSparkPlanExec should be unwrapped via .executedPlan()."""
+    from cluster_yield_snapshot._compat import _collect_metrics_recursive
+
+    # Build the real scan node inside the final plan (has metrics)
+    mock_metric = MagicMock()
+    mock_metric.value.return_value = 500000
+
+    mock_pair = MagicMock()
+    mock_pair._1.return_value = "number of output rows"
+    mock_pair._2.return_value = mock_metric
+
+    mock_seq = MagicMock()
+    mock_seq.size.return_value = 1
+    mock_seq.apply.return_value = mock_pair
+
+    scan_node = MagicMock()
+    scan_node.nodeName.return_value = "FileScan parquet"
+    scan_node.getClass.return_value.getSimpleName.return_value = "FileSourceScanExec"
+    scan_node.metrics.return_value.toSeq.return_value = mock_seq
+    scan_children = MagicMock()
+    scan_children.size.return_value = 0
+    scan_node.children.return_value = scan_children
+
+    # Build AQE wrapper — .executedPlan() returns the scan node
+    aqe_node = MagicMock()
+    aqe_node.getClass.return_value.getSimpleName.return_value = "AdaptiveSparkPlanExec"
+    aqe_node.executedPlan.return_value = scan_node
+
+    collector: list[dict] = []
+    _collect_metrics_recursive(aqe_node, collector)
+
+    # Should have skipped the AQE wrapper and collected the scan node
+    assert len(collector) == 1
+    assert collector[0]["simpleClassName"] == "FileSourceScanExec"
+    assert collector[0]["metrics"]["number of output rows"] == 500000
+
+
+def test_collect_metrics_unwraps_query_stage():
+    """QueryStageExec variants should be unwrapped via .plan()."""
+    from cluster_yield_snapshot._compat import _collect_metrics_recursive
+
+    # Build the real exchange node inside the query stage
+    mock_metric = MagicMock()
+    mock_metric.value.return_value = 1024000
+
+    mock_pair = MagicMock()
+    mock_pair._1.return_value = "data size"
+    mock_pair._2.return_value = mock_metric
+
+    mock_seq = MagicMock()
+    mock_seq.size.return_value = 1
+    mock_seq.apply.return_value = mock_pair
+
+    exchange_node = MagicMock()
+    exchange_node.nodeName.return_value = "Exchange"
+    exchange_node.getClass.return_value.getSimpleName.return_value = "ShuffleExchangeExec"
+    exchange_node.metrics.return_value.toSeq.return_value = mock_seq
+    exchange_children = MagicMock()
+    exchange_children.size.return_value = 0
+    exchange_node.children.return_value = exchange_children
+
+    # Build QueryStageExec wrapper — .plan() returns the exchange node
+    stage_node = MagicMock()
+    stage_node.getClass.return_value.getSimpleName.return_value = "ShuffleQueryStageExec"
+    stage_node.plan.return_value = exchange_node
+
+    collector: list[dict] = []
+    _collect_metrics_recursive(stage_node, collector)
+
+    # Should have skipped the stage wrapper and collected the exchange
+    assert len(collector) == 1
+    assert collector[0]["simpleClassName"] == "ShuffleExchangeExec"
+    assert collector[0]["metrics"]["data size"] == 1024000
+
+
+def test_collect_metrics_aqe_fallthrough_on_error():
+    """If AQE .executedPlan() throws, fall through to normal traversal."""
+    from cluster_yield_snapshot._compat import _collect_metrics_recursive
+
+    aqe_node = MagicMock()
+    aqe_node.getClass.return_value.getSimpleName.return_value = "AdaptiveSparkPlanExec"
+    aqe_node.executedPlan.side_effect = RuntimeError("not yet executed")
+    aqe_node.nodeName.return_value = "AdaptiveSparkPlan"
+    # No metrics on the wrapper itself
+    aqe_node.metrics.return_value.toSeq.return_value.size.return_value = 0
+    aqe_children = MagicMock()
+    aqe_children.size.return_value = 0
+    aqe_node.children.return_value = aqe_children
+
+    collector: list[dict] = []
+    _collect_metrics_recursive(aqe_node, collector)
+
+    # Falls through to normal — collects the AQE node itself
+    assert len(collector) == 1
+    assert collector[0]["simpleClassName"] == "AdaptiveSparkPlanExec"
+
+
 # ── Run all tests ────────────────────────────────────────────────────────
 
 if __name__ == "__main__":

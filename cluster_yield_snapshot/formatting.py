@@ -87,6 +87,11 @@ def render_html(snapshot: dict[str, Any], teasers: list[str] | None = None) -> s
     total_nodes = sum(p.get("nodeCount", 0) for p in plans)
     total_size = sum(t.get("sizeInBytes", 0) for t in tables.values())
 
+    # Aggregate runtime I/O metrics
+    total_scan = sum(scan_bytes_from_entry(p) for p in plans)
+    total_shuffle = sum(shuffle_bytes_from_entry(p) for p in plans)
+    plans_with_metrics = sum(1 for p in plans if has_metrics(p))
+
     # Table rows
     table_rows = ""
     for tname, tstats in sorted(
@@ -109,7 +114,7 @@ def render_html(snapshot: dict[str, Any], teasers: list[str] | None = None) -> s
             f'<td style="text-align:right">{file_str}</td></tr>'
         )
 
-    # Plan rows
+    # Plan rows — include per-plan scan/shuffle when metrics are available
     plan_rows = ""
     for p in plans:
         label = p.get("label", "?")
@@ -118,9 +123,20 @@ def render_html(snapshot: dict[str, Any], teasers: list[str] | None = None) -> s
         sql = p.get("sql", "")
         sql_preview = (sql[:80] + "...") if len(sql) > 80 else sql
 
+        if has_metrics(p):
+            scan_b = scan_bytes_from_entry(p)
+            shuf_b = shuffle_bytes_from_entry(p)
+            io_str = fmt_bytes(scan_b) if scan_b else "—"
+            shuf_str = fmt_bytes(shuf_b) if shuf_b else "—"
+        else:
+            io_str = "—"
+            shuf_str = "—"
+
         plan_rows += (
             f'<tr><td style="font-family:monospace;font-size:13px">{esc_html(label)}</td>'
             f'<td style="text-align:right">{nodes}</td>'
+            f'<td style="text-align:right">{io_str}</td>'
+            f'<td style="text-align:right">{shuf_str}</td>'
             f'<td style="font-family:monospace;font-size:11px;color:#666">{fp}</td>'
             f'<td style="font-size:12px;color:#555">{esc_html(sql_preview)}</td></tr>'
         )
@@ -161,6 +177,16 @@ def render_html(snapshot: dict[str, Any], teasers: list[str] | None = None) -> s
     compute = env.get("computeType", "")
     compute_str = f" · {esc_html(compute)}" if compute else ""
 
+    # Runtime I/O stats cards (only when metrics are present)
+    io_cards = ""
+    if plans_with_metrics > 0:
+        io_cards = (
+            f'<div><span style="font-size:28px;font-weight:700">{fmt_bytes(total_scan)}</span>'
+            f'<br><span style="font-size:12px;color:#666">Scanned</span></div>'
+            f'<div><span style="font-size:28px;font-weight:700">{fmt_bytes(total_shuffle)}</span>'
+            f'<br><span style="font-size:12px;color:#666">Shuffled</span></div>'
+        )
+
     return f"""
     <div style="font-family:-apple-system,BlinkMacSystemFont,sans-serif;
                 max-width:900px;margin:20px auto;color:#333">
@@ -182,6 +208,7 @@ def render_html(snapshot: dict[str, Any], teasers: list[str] | None = None) -> s
                      <br><span style="font-size:12px;color:#666">Tables</span></div>
                 <div><span style="font-size:28px;font-weight:700">{fmt_bytes(total_size)}</span>
                      <br><span style="font-size:12px;color:#666">Data Volume</span></div>
+                {io_cards}
             </div>
         </div>
         <div style="background:white;padding:16px 24px;border:1px solid #dee2e6;border-top:0;
@@ -204,10 +231,12 @@ def render_html(snapshot: dict[str, Any], teasers: list[str] | None = None) -> s
                 <tr style="background:#f5f5f5">
                     <th style="text-align:left;padding:6px 12px">Label</th>
                     <th style="text-align:right;padding:6px 12px">Nodes</th>
+                    <th style="text-align:right;padding:6px 12px">Scanned</th>
+                    <th style="text-align:right;padding:6px 12px">Shuffled</th>
                     <th style="text-align:left;padding:6px 12px">Fingerprint</th>
                     <th style="text-align:left;padding:6px 12px">SQL</th>
                 </tr>
-                {plan_rows or '<tr><td colspan="4" style="padding:12px;color:#999">No plans captured</td></tr>'}
+                {plan_rows or '<tr><td colspan="6" style="padding:12px;color:#999">No plans captured</td></tr>'}
             </table>
             {"<p style='margin-top:16px;color:#999;font-size:12px'>⚠ " + str(len(errors)) + " warnings — see snapshot JSON for details.</p>" if errors else ""}
             <p style="margin-top:20px;font-size:13px;color:#666">
