@@ -53,7 +53,7 @@ def get_plan_text(df: DataFrame) -> Optional[str]:
     """
     # Strategy 1: _explain_string (PySpark 3.4+, Spark Connect)
     try:
-        return df._explain_string(extended=True)
+        return df._explain_string("formatted")
     except AttributeError:
         pass
 

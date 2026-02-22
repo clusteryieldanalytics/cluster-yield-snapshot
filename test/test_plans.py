@@ -520,6 +520,166 @@ def test_details_empty_input():
     assert d["nodes"] == {}
     assert d.get("scans", []) == []
 
+
+# ── Formatted mode tests (actual Databricks Spark 4.1 Connect output) ──
+
+FORMATTED_PLAN = """\
+== Physical Plan ==
+AdaptiveSparkPlan (10)
++- == Initial Plan ==
+   ColumnarToRow (9)
+   +- PhotonResultStage (8)
+      +- PhotonProject (7)
+         +- PhotonBroadcastHashJoin (6)
+            :- PhotonScan parquet workspace.default.test_orders (1)
+            +- PhotonShuffleExchangeSource (5)
+               +- PhotonShuffleMapStage (4)
+                  +- PhotonShuffleExchangeSink (3)
+                     +- PhotonScan parquet workspace.default.test_customers (2)
+
+(1) PhotonScan parquet workspace.default.test_orders
+Output [3]: [order_id#26125L, customer_id#26126L, amount#26130]
+DataFilters: [isnotnull(amount#26130), isnotnull(customer_id#26126L), (amount#26130 > 50.0)]
+DictionaryFilters: [(amount#26130 > 50.0)]
+Format: parquet
+Location: PreparedDeltaFileIndex(1 paths)[s3://dbstorage-prod/data/orders]
+OptionalDataFilters: [hashedrelationcontains(customer_id#26126L)]
+PartitionFilters: []
+ReadSchema: struct<order_id:bigint,customer_id:bigint,amount:double>
+RequiredDataFilters: [isnotnull(amount#26130), isnotnull(customer_id#26126L), (amount#26130 > 50.0)]
+
+(2) PhotonScan parquet workspace.default.test_customers
+Output [2]: [customer_id#26135L, name#26136]
+DataFilters: [isnotnull(customer_id#26135L)]
+DictionaryFilters: []
+Format: parquet
+Location: PreparedDeltaFileIndex(1 paths)[s3://dbstorage-prod/data/customers]
+OptionalDataFilters: []
+PartitionFilters: []
+ReadSchema: struct<customer_id:bigint,name:string>
+RequiredDataFilters: [isnotnull(customer_id#26135L)]
+
+(3) PhotonShuffleExchangeSink
+Input [2]: [customer_id#26135L, name#26136]
+Arguments: SinglePartition
+
+(4) PhotonShuffleMapStage
+Input [2]: [customer_id#26135L, name#26136]
+Arguments: EXECUTOR_BROADCAST, [id=#25799]
+
+(5) PhotonShuffleExchangeSource
+Input [2]: [customer_id#26135L, name#26136]
+
+(6) PhotonBroadcastHashJoin
+Left keys [1]: [customer_id#26126L]
+Right keys [1]: [customer_id#26135L]
+Join type: Inner
+Join condition: None
+
+(7) PhotonProject
+Input [5]: [order_id#26125L, customer_id#26126L, amount#26130, customer_id#26135L, name#26136]
+Arguments: [order_id#26125L, name#26136, amount#26130]
+
+(8) PhotonResultStage
+Input [3]: [order_id#26125L, name#26136, amount#26130]
+
+(9) ColumnarToRow
+Input [3]: [order_id#26125L, name#26136, amount#26130]
+
+(10) AdaptiveSparkPlan
+Output [3]: [order_id#26125L, name#26136, amount#26130]
+Arguments: isFinalPlan=false
+
+== Photon Explanation ==
+The query is fully supported by Photon.
+== Optimizer Statistics (table names per statistics state) ==
+  missing =\x20
+  partial =\x20
+  full    = test_customers, test_orders
+"""
+
+
+def test_formatted_operators_from_text():
+    """operators_from_text should work with formatted mode tree."""
+    ops = operators_from_text(FORMATTED_PLAN)
+    assert "AdaptiveSparkPlan" in ops
+    assert "PhotonBroadcastHashJoin" in ops
+    assert "PhotonScan" in ops
+    assert "ColumnarToRow" in ops
+
+
+def test_formatted_tree_stops_at_details():
+    """extract_physical_plan should not include detail section nodes."""
+    tree = extract_physical_plan(FORMATTED_PLAN)
+    # Tree should NOT contain detail section lines
+    assert "(1) PhotonScan" not in tree
+    assert "ReadSchema:" not in tree
+
+
+def test_formatted_details_scans():
+    """Formatted mode detail sections should parse scans."""
+    d = parse_plan_details(FORMATTED_PLAN)
+    assert len(d["scans"]) == 2
+    orders = [s for s in d["scans"] if "orders" in s.get("table", "")][0]
+    assert orders["format"] == "parquet"
+    assert orders["table"] == "workspace.default.test_orders"
+    assert orders.get("readColumnCount") == 3
+    assert orders["hasDataFilter"] is True
+    assert orders["hasPartitionFilter"] is False  # PartitionFilters: []
+
+
+def test_formatted_details_read_schema():
+    """ReadSchema should parse correctly from formatted detail sections."""
+    d = parse_plan_details(FORMATTED_PLAN)
+    orders_node = d["nodes"]["1"]
+    schema = orders_node.get("readSchema", {})
+    assert "order_id" in schema
+    assert schema["order_id"] == "bigint"
+    assert schema["amount"] == "double"
+
+
+def test_formatted_details_join():
+    """Join should be parsed from formatted detail section."""
+    d = parse_plan_details(FORMATTED_PLAN)
+    assert len(d["joins"]) == 1
+    join = d["joins"][0]
+    assert join["strategy"] == "BroadcastHashJoin"
+    node = d["nodes"]["6"]
+    assert node["joinType"] == "Inner"
+    assert "customer_id" in node.get("leftKeys", [])
+    assert "customer_id" in node.get("rightKeys", [])
+
+
+def test_formatted_details_exchange():
+    """Exchange should be parsed from formatted detail section."""
+    d = parse_plan_details(FORMATTED_PLAN)
+    exchanges = d["exchanges"]
+    # PhotonShuffleExchangeSink is an exchange
+    sink = [e for e in exchanges if "Sink" in e["operator"]]
+    assert len(sink) == 1
+    assert sink[0].get("exchangeType") == "broadcast"  # SinglePartition
+
+
+def test_formatted_details_input_cols():
+    """Non-scan operators should have inputCount from Input lines."""
+    d = parse_plan_details(FORMATTED_PLAN)
+    project = d["nodes"]["7"]  # PhotonProject
+    assert project.get("inputCount") == 5
+    assert "order_id" in project.get("input", [])
+
+
+def test_formatted_details_photon():
+    """Photon should be detected from formatted plan."""
+    d = parse_plan_details(FORMATTED_PLAN)
+    assert d["photonEnabled"] is True
+
+
+def test_formatted_tables_from_text():
+    """tables_from_text should find tables in formatted mode tree."""
+    tables = tables_from_text(FORMATTED_PLAN)
+    assert "workspace.default.test_orders" in tables
+    assert "workspace.default.test_customers" in tables
+
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
     passed = failed = 0

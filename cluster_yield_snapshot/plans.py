@@ -293,6 +293,7 @@ def tables_from_entry(plan_entry: dict[str, Any]) -> set[str]:
 
 _NODE_HEADER = re.compile(r"^\((\d+)\)\s+(.+)")
 _OUTPUT_COLS = re.compile(r"^Output\s+\[(\d+)\]:\s+\[(.+)\]")
+_INPUT_COLS = re.compile(r"^Input\s+\[(\d+)\]:\s+\[(.+)\]")
 _READ_SCHEMA = re.compile(r"^ReadSchema:\s+struct<(.+)>")
 _FILTER_LINE = re.compile(
     r"^(PartitionFilters|DataFilters|RequiredDataFilters|"
@@ -477,13 +478,22 @@ def _parse_node_block(
         if not stripped:
             continue
 
-        # Output columns
+        # Output columns (scan operators in formatted mode)
         m = _OUTPUT_COLS.match(stripped)
         if m:
             node["outputCount"] = int(m.group(1))
             cols = _parse_column_refs(m.group(2))
             if cols:
                 node["output"] = cols
+            continue
+
+        # Input columns (non-scan operators in formatted mode)
+        m = _INPUT_COLS.match(stripped)
+        if m:
+            node["inputCount"] = int(m.group(1))
+            cols = _parse_column_refs(m.group(2))
+            if cols:
+                node["input"] = cols
             continue
 
         # ReadSchema
