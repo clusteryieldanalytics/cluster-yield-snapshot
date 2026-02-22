@@ -41,7 +41,7 @@ from .upload import upload_snapshot, upload_snapshot_urllib, UploadResult, Uploa
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
-VERSION = "0.3.6"
+VERSION = "0.3.7"
 
 
 class CYSnapshot:
@@ -216,15 +216,14 @@ class CYSnapshot:
                               f"with post-execution plan [{trigger}]")
                 return  # either upgraded or exact dup — don't add
 
-            # Case 2: Same fingerprint AND came from the same spark.sql()
-            # DataFrame (action on a DF we already captured at sql time).
-            # Only apply when old entry was spark.sql and new is action/write.
+            # Case 2: Same fingerprint
             if fp in self._fingerprints:
                 idx = self._fingerprints[fp]
                 old_trigger = self._plans[idx].get("trigger", "")
                 old_sql = self._plans[idx].get("sql")
+
                 if old_trigger == "spark.sql" and trigger != "spark.sql":
-                    # This is the pre-AQE → post-AQE upgrade for SQL queries
+                    # Pre-AQE → post-AQE upgrade for the same query
                     if old_sql and not entry.get("sql"):
                         entry["sql"] = old_sql
                         entry["label"] = self._plans[idx]["label"]
@@ -234,8 +233,17 @@ class CYSnapshot:
                     self._log(f"  ↻ Updated '{entry['label'][:60]}' "
                               f"with post-execution plan [{trigger}]")
                     return
-                # Same fingerprint from two action triggers = different
-                # queries with same plan shape. Keep both! Fall through.
+
+                # Same fingerprint, both from actions/writes.
+                # If they have different SQL text, they're different
+                # queries with the same plan shape → keep both.
+                # If neither has SQL (DF API chains) or same SQL → dedup.
+                old_sql_hash = self._sql_hash(old_sql)
+                if sql_hash and old_sql_hash and sql_hash != old_sql_hash:
+                    pass  # Different queries, same shape → fall through to store
+                else:
+                    # Same DF API chain executed twice, or cell re-run → skip
+                    return
 
             # ── Store the plan ────────────────────────────────────────
             idx = len(self._plans)
