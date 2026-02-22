@@ -33,11 +33,14 @@ _OPERATOR_NAME = re.compile(r"([A-Z]\w*)")
 SCAN_CLASSES = frozenset({
     "FileSourceScanExec", "FileScan", "BatchScanExec",
     "HiveTableScanExec", "InMemoryTableScanExec",
+    # Databricks Photon
+    "PhotonFileSourceScanExec", "PhotonBatchScanExec",
+    "PhotonScan",
 })
 
 # Regex for table names in text plans
 _SCAN_PATTERN = re.compile(
-    r"(?:FileScan|BatchScan|Scan|HiveTableScan)\s+"
+    r"(?:FileScan|BatchScan|Scan|HiveTableScan|PhotonScan)\s+"
     r"(?:\w+\s+)?"           # optional format (parquet, orc, delta)
     r"([\w.`]+?)(?:\[|\s|$)"  # table name (possibly qualified)
 )
@@ -52,6 +55,7 @@ def capture_plan(df: DataFrame, label: str, sql: Optional[str] = None) -> dict[s
       - label, fingerprint, nodeCount
       - plan (JSON array) or planText (text explain)
       - planFormat ("json" or "text")
+      - metrics (list of per-node runtime metrics, if post-execution)
       - sql (if provided)
 
     Raises nothing — returns a partial entry on failure.
@@ -98,6 +102,15 @@ def capture_plan(df: DataFrame, label: str, sql: Optional[str] = None) -> dict[s
 
     if sql:
         entry["sql"] = sql
+
+    # Runtime metrics — only populated post-execution on classic PySpark.
+    # Pre-execution captures (trigger="spark.sql") will get None here,
+    # which is correct — the job hasn't run yet. The dedup logic in
+    # CYSnapshot._on_plan_captured replaces pre-execution entries with
+    # post-execution ones, so metrics arrive with the final capture.
+    metrics = _compat.get_plan_metrics(df)
+    if metrics:
+        entry["metrics"] = metrics
 
     return entry
 
@@ -149,11 +162,16 @@ def operators_from_entry(plan_entry: dict[str, Any]) -> list[str]:
 
 def extract_physical_plan(explain_text: str) -> str:
     """
-    Extract the Physical Plan section from EXPLAIN EXTENDED output.
+    Extract the Physical Plan tree section from EXPLAIN EXTENDED output.
 
     EXPLAIN EXTENDED has multiple sections (Parsed, Analyzed, Optimized,
-    Physical). We want only Physical. If section headers are absent,
-    the entire text is treated as the physical plan.
+    Physical). We want only the tree portion of Physical. If section
+    headers are absent, the entire text is treated as the physical plan.
+
+    Stops at the numbered detail section (lines like "(1) FileScan ...")
+    which Spark appends after the tree. These detail lines start with
+    a parenthesized number and would otherwise be misidentified as
+    operators by parse_operator_line.
     """
     marker = "== Physical Plan =="
     idx = explain_text.find(marker)
@@ -162,7 +180,19 @@ def extract_physical_plan(explain_text: str) -> str:
 
     after = explain_text[idx + len(marker):]
     next_section = after.find("\n== ")
-    return after[:next_section] if next_section != -1 else after
+    if next_section != -1:
+        after = after[:next_section]
+
+    # Stop at the numbered detail section boundary.
+    # Detail nodes start with "(N) OperatorName" at the start of a line.
+    lines = after.split("\n")
+    tree_lines: list[str] = []
+    for line in lines:
+        if re.match(r"^\(\d+\)\s+\w+", line):
+            break
+        tree_lines.append(line)
+
+    return "\n".join(tree_lines)
 
 
 def parse_operator_line(line: str) -> Optional[str]:
@@ -245,3 +275,81 @@ def tables_from_entry(plan_entry: dict[str, Any]) -> set[str]:
     if plan_text:
         return tables_from_text(plan_text)
     return set()
+
+
+# ── Runtime metric accessors ─────────────────────────────────────────────
+#
+# These pull aggregated cost-relevant numbers from the per-node metrics
+# captured post-execution. Used by quick_scan for teasers and by the
+# server-side cost estimator (roadmap #15).
+
+
+def _sum_metric(plan_entry: dict[str, Any], class_filter: str,
+                metric_name: str) -> int:
+    """Sum a named metric across all nodes whose simpleClassName contains class_filter."""
+    total = 0
+    for node in plan_entry.get("metrics", []):
+        if class_filter in node.get("simpleClassName", ""):
+            total += node.get("metrics", {}).get(metric_name, 0)
+    return total
+
+
+def scan_bytes_from_entry(plan_entry: dict[str, Any]) -> int:
+    """Total bytes scanned across all scan nodes (from runtime metrics)."""
+    return _sum_metric(plan_entry, "Scan", "size of files read")
+
+
+def scan_rows_from_entry(plan_entry: dict[str, Any]) -> int:
+    """Total rows output from all scan nodes (from runtime metrics)."""
+    return _sum_metric(plan_entry, "Scan", "number of output rows")
+
+
+def scan_files_from_entry(plan_entry: dict[str, Any]) -> int:
+    """Total files read across all scan nodes (from runtime metrics)."""
+    return _sum_metric(plan_entry, "Scan", "number of files read")
+
+
+def shuffle_bytes_from_entry(plan_entry: dict[str, Any]) -> int:
+    """Total bytes shuffled across all exchange nodes (from runtime metrics)."""
+    # Match ShuffleExchange, PhotonShuffleExchangeSink, etc. but not Broadcast
+    total = 0
+    for node in plan_entry.get("metrics", []):
+        cn = node.get("simpleClassName", "")
+        if ("Shuffle" in cn or "Exchange" in cn) and "Broadcast" not in cn:
+            total += node.get("metrics", {}).get("data size", 0)
+    return total
+
+
+def broadcast_bytes_from_entry(plan_entry: dict[str, Any]) -> int:
+    """Total bytes broadcast across all broadcast exchange nodes."""
+    total = 0
+    for node in plan_entry.get("metrics", []):
+        cn = node.get("simpleClassName", "")
+        if "Broadcast" in cn and "Exchange" in cn:
+            total += node.get("metrics", {}).get("data size", 0)
+    return total
+
+
+def has_metrics(plan_entry: dict[str, Any]) -> bool:
+    """Return True if this plan entry has runtime metrics."""
+    metrics = plan_entry.get("metrics")
+    return bool(metrics and any(n.get("metrics") for n in metrics))
+
+
+def metrics_summary(plan_entry: dict[str, Any]) -> dict[str, Any]:
+    """
+    Compute a flat summary of runtime metrics for a plan entry.
+
+    Returns a dict with top-level cost-relevant aggregates that the
+    server-side cost estimator can consume directly.  All byte values
+    are raw ints; formatting is the caller's responsibility.
+    """
+    if not has_metrics(plan_entry):
+        return {}
+    return {
+        "scanBytes": scan_bytes_from_entry(plan_entry),
+        "scanRows": scan_rows_from_entry(plan_entry),
+        "scanFiles": scan_files_from_entry(plan_entry),
+        "shuffleBytes": shuffle_bytes_from_entry(plan_entry),
+        "broadcastBytes": broadcast_bytes_from_entry(plan_entry),
+    }

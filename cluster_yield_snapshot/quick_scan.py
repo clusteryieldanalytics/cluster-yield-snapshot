@@ -9,7 +9,11 @@ from __future__ import annotations
 
 from typing import Any
 
-from .plans import operators_from_entry
+from .plans import (
+    operators_from_entry, has_metrics,
+    scan_bytes_from_entry, scan_rows_from_entry, scan_files_from_entry,
+    shuffle_bytes_from_entry,
+)
 from ._util import fmt_bytes, parse_int
 
 
@@ -42,6 +46,28 @@ def quick_scan(
                 teasers.append(
                     f"BroadcastNestedLoopJoin in `{label}` — "
                     f"quadratic join, check for missing equi-condition"
+                )
+
+        # Runtime metric teasers (post-execution captures only)
+        if has_metrics(p):
+            scan_b = scan_bytes_from_entry(p)
+            scan_r = scan_rows_from_entry(p)
+            scan_f = scan_files_from_entry(p)
+            shuf_b = shuffle_bytes_from_entry(p)
+
+            short_label = label[:60]
+            if scan_b > 0:
+                parts = [fmt_bytes(scan_b)]
+                if scan_r > 0:
+                    parts.append(f"{scan_r:,} rows")
+                if scan_f > 0:
+                    parts.append(f"{scan_f} files")
+                teasers.append(
+                    f"`{short_label}` scanned {', '.join(parts)}"
+                )
+            if shuf_b > 0:
+                teasers.append(
+                    f"`{short_label}` shuffled {fmt_bytes(shuf_b)}"
                 )
 
     # Broadcast disabled check

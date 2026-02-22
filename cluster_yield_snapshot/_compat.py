@@ -137,3 +137,149 @@ def get_executor_info(spark: SparkSession) -> dict[str, Any]:
     except Exception:
         pass
     return info
+
+
+# ── Runtime metric extraction ─────────────────────────────────────────────
+
+# Photon and Databricks use different metric names for the same concept.
+# Canonicalize to a standard set so downstream code doesn't branch.
+_METRIC_ALIASES: dict[str, str] = {
+    "photon rows read": "number of output rows",
+    "num output rows": "number of output rows",
+    "photon scan time": "scan time",
+    "photon data size": "data size",
+    "shuffle bytes written": "data size",
+}
+
+
+def get_plan_metrics(df: DataFrame) -> Optional[list[dict[str, Any]]]:
+    """
+    Extract runtime SQLMetric values from every node in the executed plan.
+
+    After a DataFrame action completes, each SparkPlan node in the
+    executedPlan() tree has its ``metrics`` map populated with actual
+    runtime values (bytes scanned, rows read, shuffle size, etc.).
+    These are the numbers visible in the Spark UI SQL tab.
+
+    Only works on classic PySpark post-execution. Returns None on
+    Spark Connect or if the JVM plan is inaccessible.
+    """
+    try:
+        plan = df._jdf.queryExecution().executedPlan()
+        nodes: list[dict[str, Any]] = []
+        _collect_metrics_recursive(plan, nodes)
+        # Only return if we got at least one node with actual data
+        if any(n.get("metrics") for n in nodes):
+            return nodes
+        return None
+    except Exception:
+        return None
+
+
+def _collect_metrics_recursive(
+    plan_node: Any,
+    collector: list[dict[str, Any]],
+) -> None:
+    """
+    Walk the SparkPlan tree depth-first, extracting metrics from each node.
+
+    Each node produces::
+
+        {
+            "nodeName": "FileScan parquet ...",
+            "simpleClassName": "FileSourceScanExec",
+            "metrics": {"number of output rows": 184729, ...}
+        }
+
+    Metrics with value 0 are omitted to keep the snapshot compact —
+    most nodes have many registered metrics that never fire.
+    """
+    try:
+        node_name = str(plan_node.nodeName())
+    except Exception:
+        node_name = "unknown"
+
+    try:
+        class_name = str(plan_node.getClass().getSimpleName())
+    except Exception:
+        class_name = node_name
+
+    node_info: dict[str, Any] = {
+        "nodeName": node_name,
+        "simpleClassName": class_name,
+    }
+
+    metrics = _extract_node_metrics(plan_node)
+    if metrics:
+        node_info["metrics"] = metrics
+
+    collector.append(node_info)
+
+    # Recurse into children
+    try:
+        children = plan_node.children()
+        size = children.size()
+        for i in range(size):
+            _collect_metrics_recursive(children.apply(i), collector)
+    except Exception:
+        pass
+
+
+def _extract_node_metrics(plan_node: Any) -> dict[str, int]:
+    """
+    Extract the metrics map from a single SparkPlan node.
+
+    Tries two JVM iteration strategies:
+      1. Scala .toSeq() — works on most Spark/Databricks versions
+      2. JavaConverters — fallback for environments where .toSeq() fails
+
+    Returns only non-zero metrics. Canonicalizes Photon/Databricks
+    metric names via _METRIC_ALIASES.
+    """
+    metrics: dict[str, int] = {}
+
+    try:
+        metrics_map = plan_node.metrics()
+    except Exception:
+        return metrics
+
+    # Strategy 1: iterate via .toSeq()
+    try:
+        seq = metrics_map.toSeq()
+        size = seq.size()
+        for i in range(size):
+            pair = seq.apply(i)
+            name = str(pair._1())
+            try:
+                value = int(pair._2().value())
+                if value != 0:
+                    canonical = _METRIC_ALIASES.get(name, name)
+                    metrics[canonical] = value
+            except Exception:
+                pass
+        return metrics
+    except Exception:
+        pass
+
+    # Strategy 2: JavaConverters fallback (Scala 2.12 / Databricks)
+    try:
+        # Access the JVM gateway through the py4j bridge
+        gateway = plan_node._gateway  # type: ignore[attr-defined]
+        java_map = (
+            gateway.jvm.scala.collection.JavaConverters
+            .mapAsJavaMapConverter(metrics_map)
+            .asJava()
+        )
+        for name_obj, metric_obj in java_map.items():
+            name = str(name_obj)
+            try:
+                value = int(metric_obj.value())
+                if value != 0:
+                    canonical = _METRIC_ALIASES.get(name, name)
+                    metrics[canonical] = value
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return metrics

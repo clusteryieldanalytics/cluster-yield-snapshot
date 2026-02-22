@@ -7,7 +7,10 @@ from __future__ import annotations
 from typing import Any
 
 from ._util import fmt_bytes, esc_html, parse_int
-from .plans import operators_from_entry
+from .plans import (
+    operators_from_entry, has_metrics,
+    scan_bytes_from_entry, shuffle_bytes_from_entry,
+)
 
 
 def print_summary(snapshot: dict[str, Any], teasers: list[str] | None = None) -> None:
@@ -21,6 +24,11 @@ def print_summary(snapshot: dict[str, Any], teasers: list[str] | None = None) ->
 
     total_nodes = sum(p.get("nodeCount", 0) for p in plans)
     total_size = sum(t.get("sizeInBytes", 0) for t in tables.values())
+
+    # Aggregate runtime I/O metrics across all plans
+    total_scan = sum(scan_bytes_from_entry(p) for p in plans)
+    total_shuffle = sum(shuffle_bytes_from_entry(p) for p in plans)
+    plans_with_metrics = sum(1 for p in plans if has_metrics(p))
 
     print("\n" + "═" * 60)
     print("  CLUSTER YIELD SNAPSHOT SUMMARY")
@@ -37,8 +45,17 @@ def print_summary(snapshot: dict[str, Any], teasers: list[str] | None = None) ->
     print(f"  Tables cataloged:   {len(tables)}")
     if total_size > 0:
         print(f"  Total data volume:  {fmt_bytes(total_size)}")
+
+    if plans_with_metrics > 0:
+        print(f"\n  ── Runtime I/O ({plans_with_metrics} plan"
+              f"{'s' if plans_with_metrics != 1 else ''} with metrics) ──")
+        if total_scan > 0:
+            print(f"  Total scanned:      {fmt_bytes(total_scan)}")
+        if total_shuffle > 0:
+            print(f"  Total shuffled:     {fmt_bytes(total_shuffle)}")
+
     if non_default:
-        print(f"  Non-default configs: {len(non_default)}")
+        print(f"\n  Non-default configs: {len(non_default)}")
         for key, info in non_default.items():
             short_key = key.replace("spark.sql.", "")
             print(f"    {short_key}: {info['value']} "
