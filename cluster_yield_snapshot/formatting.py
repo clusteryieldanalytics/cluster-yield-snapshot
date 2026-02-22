@@ -31,6 +31,12 @@ def print_summary(snapshot: dict[str, Any], teasers: list[str] | None = None) ->
     total_shuffle = sum(shuffle_bytes_from_entry(p) for p in plans)
     plans_with_metrics = sum(1 for p in plans if has_metrics(p))
 
+    # Partition enrichment stats
+    tables_with_partitions = sum(
+        1 for t in tables.values() if t.get("partitionCount")
+    )
+    tables_with_rows = sum(1 for t in tables.values() if t.get("rowCount"))
+
     print("\n" + "═" * 60)
     print("  CLUSTER YIELD SNAPSHOT SUMMARY")
     print("═" * 60)
@@ -46,6 +52,10 @@ def print_summary(snapshot: dict[str, Any], teasers: list[str] | None = None) ->
     print(f"  Tables cataloged:   {len(tables)}")
     if total_size > 0:
         print(f"  Total data volume:  {fmt_bytes(total_size)}")
+    if tables_with_rows:
+        print(f"  Row counts:         {tables_with_rows}/{len(tables)} tables")
+    if tables_with_partitions:
+        print(f"  Partition metadata:  {tables_with_partitions}/{len(tables)} tables")
 
     if plans_with_metrics > 0:
         print(f"\n  ── Runtime I/O ({plans_with_metrics} plan"
@@ -102,16 +112,22 @@ def render_html(snapshot: dict[str, Any], teasers: list[str] | None = None) -> s
         size = tstats.get("sizeInBytes", 0)
         rows = tstats.get("rowCount")
         pcols = tstats.get("partitionColumns", [])
+        pcount = tstats.get("partitionCount")
         files = tstats.get("fileCount")
+        cols = tstats.get("columnCount")
 
         row_str = f"{rows:,}" if rows else "—"
         pcol_str = ", ".join(pcols) if pcols else "—"
+        if pcount is not None:
+            pcol_str += f" ({pcount:,})"
         file_str = str(files) if files else "—"
+        col_str = str(cols) if cols else "—"
 
         table_rows += (
             f'<tr><td style="font-family:monospace;font-size:13px">{esc_html(tname)}</td>'
             f'<td style="text-align:right">{fmt_bytes(size)}</td>'
             f'<td style="text-align:right">{row_str}</td>'
+            f'<td style="text-align:right">{col_str}</td>'
             f'<td>{pcol_str}</td>'
             f'<td style="text-align:right">{file_str}</td></tr>'
         )
@@ -286,10 +302,11 @@ def render_html(snapshot: dict[str, Any], teasers: list[str] | None = None) -> s
                     <th style="text-align:left;padding:6px 12px">Table</th>
                     <th style="text-align:right;padding:6px 12px">Size</th>
                     <th style="text-align:right;padding:6px 12px">Rows</th>
+                    <th style="text-align:right;padding:6px 12px">Cols</th>
                     <th style="text-align:left;padding:6px 12px">Partitions</th>
                     <th style="text-align:right;padding:6px 12px">Files</th>
                 </tr>
-                {table_rows or '<tr><td colspan="5" style="padding:12px;color:#999">No tables cataloged</td></tr>'}
+                {table_rows or '<tr><td colspan="6" style="padding:12px;color:#999">No tables cataloged</td></tr>'}
             </table>
             {scan_section}
             <h3 style="margin:20px 0 8px">Captured Plans</h3>

@@ -70,6 +70,7 @@ class CYSnapshot:
         environment: Optional[str] = None,
         base_url: Optional[str] = None,
         quiet: bool = False,
+        count_rows: bool = False,
     ):
         """
         Args:
@@ -78,12 +79,16 @@ class CYSnapshot:
             environment: Environment label (e.g. "prod-analytics")
             base_url: Override API base URL (for self-hosted)
             quiet: Suppress progress output
+            count_rows: If True, fall back to COUNT(*) for row counts
+                when cheaper methods fail. Accurate but potentially slow
+                on very large tables.
         """
         self._spark = spark
         self._api_key = api_key
         self._environment = environment
         self._base_url = base_url
         self._quiet = quiet
+        self._count_rows = count_rows
 
         self._plans: list[dict[str, Any]] = []
         self._catalog_tables: dict[str, dict[str, Any]] = {}
@@ -415,7 +420,9 @@ class CYSnapshot:
         if table_name in self._catalog_tables:
             return
         try:
-            stats = _catalog.get_table_stats(self._spark, table_name)
+            stats = _catalog.get_table_stats(
+                self._spark, table_name, count_rows=self._count_rows
+            )
             if stats:
                 self._catalog_tables[table_name] = stats
         except Exception as e:
