@@ -312,6 +312,64 @@ def test_passive_capture_callback_exception_doesnt_break():
 
 # ── _compat metric extraction tests (mocked JVM) ────────────────────────
 
+def _make_mock_metrics_map(name_value_pairs):
+    """
+    Build a mock Scala Map[String, SQLMetric] that supports keysIterator + apply.
+
+    This mocks Strategy 2 (keysIterator) from _extract_node_metrics,
+    which is the path taken when jvm=None (i.e. in unit tests).
+    """
+    # Build per-metric mocks
+    metric_mocks = {}
+    for name, value in name_value_pairs:
+        m = MagicMock()
+        m.value.return_value = value
+        metric_mocks[name] = m
+
+    # keysIterator returns a Java-style Iterator (hasNext/next)
+    keys = list(metric_mocks.keys())
+    key_iter = MagicMock()
+    call_count = {"i": 0}
+    def has_next():
+        return call_count["i"] < len(keys)
+    def next_key():
+        idx = call_count["i"]
+        call_count["i"] += 1
+        return keys[idx]
+    key_iter.hasNext = has_next
+    key_iter.next = next_key
+
+    mock_map = MagicMock()
+    mock_map.keysIterator.return_value = key_iter
+    mock_map.apply = lambda k: metric_mocks[str(k)]
+    return mock_map
+
+
+def _make_mock_node(class_name, node_name=None, metrics=None, children=None):
+    """Build a mock SparkPlan node for testing."""
+    node = MagicMock()
+    node.getClass.return_value.getSimpleName.return_value = class_name
+    node.nodeName.return_value = node_name or class_name
+    if metrics:
+        node.metrics.return_value = _make_mock_metrics_map(metrics)
+    else:
+        # Empty metrics — keysIterator immediately returns False for hasNext
+        empty_iter = MagicMock()
+        empty_iter.hasNext = lambda: False
+        empty_map = MagicMock()
+        empty_map.keysIterator.return_value = empty_iter
+        node.metrics.return_value = empty_map
+
+    child_seq = MagicMock()
+    if children:
+        child_seq.size.return_value = len(children)
+        child_seq.apply = lambda i: children[i]
+    else:
+        child_seq.size.return_value = 0
+    node.children.return_value = child_seq
+    return node
+
+
 def test_metric_aliases_canonical():
     """Photon metric names should be canonicalized."""
     from cluster_yield_snapshot._compat import _METRIC_ALIASES
@@ -345,29 +403,11 @@ def test_collect_metrics_recursive_basic():
     """_collect_metrics_recursive should walk plan tree and extract metrics."""
     from cluster_yield_snapshot._compat import _collect_metrics_recursive
 
-    # Build a mock JVM plan node with one metric
-    mock_metric = MagicMock()
-    mock_metric.value.return_value = 12345
-
-    mock_pair = MagicMock()
-    mock_pair._1.return_value = "number of output rows"
-    mock_pair._2.return_value = mock_metric
-
-    mock_seq = MagicMock()
-    mock_seq.size.return_value = 1
-    mock_seq.apply.return_value = mock_pair
-
-    mock_metrics_map = MagicMock()
-    mock_metrics_map.toSeq.return_value = mock_seq
-
-    mock_node = MagicMock()
-    mock_node.nodeName.return_value = "FileScan parquet"
-    mock_node.getClass.return_value.getSimpleName.return_value = "FileSourceScanExec"
-    mock_node.metrics.return_value = mock_metrics_map
-    # No children
-    mock_children = MagicMock()
-    mock_children.size.return_value = 0
-    mock_node.children.return_value = mock_children
+    mock_node = _make_mock_node(
+        "FileSourceScanExec",
+        node_name="FileScan parquet",
+        metrics=[("number of output rows", 12345)],
+    )
 
     collector: list[dict] = []
     _collect_metrics_recursive(mock_node, collector)
@@ -382,33 +422,11 @@ def test_collect_metrics_skips_zero_values():
     """Metrics with value 0 should be omitted."""
     from cluster_yield_snapshot._compat import _collect_metrics_recursive
 
-    mock_metric_zero = MagicMock()
-    mock_metric_zero.value.return_value = 0
-    mock_metric_nonzero = MagicMock()
-    mock_metric_nonzero.value.return_value = 42
-
-    mock_pair_zero = MagicMock()
-    mock_pair_zero._1.return_value = "spill size"
-    mock_pair_zero._2.return_value = mock_metric_zero
-
-    mock_pair_real = MagicMock()
-    mock_pair_real._1.return_value = "data size"
-    mock_pair_real._2.return_value = mock_metric_nonzero
-
-    mock_seq = MagicMock()
-    mock_seq.size.return_value = 2
-    mock_seq.apply.side_effect = [mock_pair_zero, mock_pair_real]
-
-    mock_metrics_map = MagicMock()
-    mock_metrics_map.toSeq.return_value = mock_seq
-
-    mock_node = MagicMock()
-    mock_node.nodeName.return_value = "Exchange"
-    mock_node.getClass.return_value.getSimpleName.return_value = "ShuffleExchangeExec"
-    mock_node.metrics.return_value = mock_metrics_map
-    mock_children = MagicMock()
-    mock_children.size.return_value = 0
-    mock_node.children.return_value = mock_children
+    mock_node = _make_mock_node(
+        "ShuffleExchangeExec",
+        node_name="Exchange",
+        metrics=[("spill size", 0), ("data size", 42)],
+    )
 
     collector: list[dict] = []
     _collect_metrics_recursive(mock_node, collector)
@@ -421,27 +439,11 @@ def test_collect_metrics_canonicalizes_photon_names():
     """Photon-specific metric names should be mapped to standard names."""
     from cluster_yield_snapshot._compat import _collect_metrics_recursive
 
-    mock_metric = MagicMock()
-    mock_metric.value.return_value = 99999
-
-    mock_pair = MagicMock()
-    mock_pair._1.return_value = "photon rows read"  # should become "number of output rows"
-    mock_pair._2.return_value = mock_metric
-
-    mock_seq = MagicMock()
-    mock_seq.size.return_value = 1
-    mock_seq.apply.return_value = mock_pair
-
-    mock_metrics_map = MagicMock()
-    mock_metrics_map.toSeq.return_value = mock_seq
-
-    mock_node = MagicMock()
-    mock_node.nodeName.return_value = "PhotonScan"
-    mock_node.getClass.return_value.getSimpleName.return_value = "PhotonFileSourceScanExec"
-    mock_node.metrics.return_value = mock_metrics_map
-    mock_children = MagicMock()
-    mock_children.size.return_value = 0
-    mock_node.children.return_value = mock_children
+    mock_node = _make_mock_node(
+        "PhotonFileSourceScanExec",
+        node_name="PhotonScan",
+        metrics=[("photon rows read", 99999)],
+    )
 
     collector: list[dict] = []
     _collect_metrics_recursive(mock_node, collector)
@@ -455,28 +457,10 @@ def test_collect_metrics_recursive_with_children():
     """Should walk into child nodes."""
     from cluster_yield_snapshot._compat import _collect_metrics_recursive
 
-    # Build child node (no metrics, no children)
-    child_node = MagicMock()
-    child_node.nodeName.return_value = "Filter"
-    child_node.getClass.return_value.getSimpleName.return_value = "FilterExec"
-    child_metrics_map = MagicMock()
-    child_metrics_map.toSeq.return_value.size.return_value = 0
-    child_node.metrics.return_value = child_metrics_map
-    child_children = MagicMock()
-    child_children.size.return_value = 0
-    child_node.children.return_value = child_children
-
-    # Build parent node with one child
-    parent_node = MagicMock()
-    parent_node.nodeName.return_value = "Project"
-    parent_node.getClass.return_value.getSimpleName.return_value = "ProjectExec"
-    parent_metrics_map = MagicMock()
-    parent_metrics_map.toSeq.return_value.size.return_value = 0
-    parent_node.metrics.return_value = parent_metrics_map
-    parent_children = MagicMock()
-    parent_children.size.return_value = 1
-    parent_children.apply.return_value = child_node
-    parent_node.children.return_value = parent_children
+    child_node = _make_mock_node("FilterExec", node_name="Filter")
+    parent_node = _make_mock_node(
+        "ProjectExec", node_name="Project", children=[child_node]
+    )
 
     collector: list[dict] = []
     _collect_metrics_recursive(parent_node, collector)
@@ -490,25 +474,11 @@ def test_collect_metrics_unwraps_aqe():
     """AdaptiveSparkPlanExec should be unwrapped via .executedPlan()."""
     from cluster_yield_snapshot._compat import _collect_metrics_recursive
 
-    # Build the real scan node inside the final plan (has metrics)
-    mock_metric = MagicMock()
-    mock_metric.value.return_value = 500000
-
-    mock_pair = MagicMock()
-    mock_pair._1.return_value = "number of output rows"
-    mock_pair._2.return_value = mock_metric
-
-    mock_seq = MagicMock()
-    mock_seq.size.return_value = 1
-    mock_seq.apply.return_value = mock_pair
-
-    scan_node = MagicMock()
-    scan_node.nodeName.return_value = "FileScan parquet"
-    scan_node.getClass.return_value.getSimpleName.return_value = "FileSourceScanExec"
-    scan_node.metrics.return_value.toSeq.return_value = mock_seq
-    scan_children = MagicMock()
-    scan_children.size.return_value = 0
-    scan_node.children.return_value = scan_children
+    scan_node = _make_mock_node(
+        "FileSourceScanExec",
+        node_name="FileScan parquet",
+        metrics=[("number of output rows", 500000)],
+    )
 
     # Build AQE wrapper — .executedPlan() returns the scan node
     aqe_node = MagicMock()
@@ -528,25 +498,11 @@ def test_collect_metrics_unwraps_query_stage():
     """QueryStageExec variants should be unwrapped via .plan()."""
     from cluster_yield_snapshot._compat import _collect_metrics_recursive
 
-    # Build the real exchange node inside the query stage
-    mock_metric = MagicMock()
-    mock_metric.value.return_value = 1024000
-
-    mock_pair = MagicMock()
-    mock_pair._1.return_value = "data size"
-    mock_pair._2.return_value = mock_metric
-
-    mock_seq = MagicMock()
-    mock_seq.size.return_value = 1
-    mock_seq.apply.return_value = mock_pair
-
-    exchange_node = MagicMock()
-    exchange_node.nodeName.return_value = "Exchange"
-    exchange_node.getClass.return_value.getSimpleName.return_value = "ShuffleExchangeExec"
-    exchange_node.metrics.return_value.toSeq.return_value = mock_seq
-    exchange_children = MagicMock()
-    exchange_children.size.return_value = 0
-    exchange_node.children.return_value = exchange_children
+    exchange_node = _make_mock_node(
+        "ShuffleExchangeExec",
+        node_name="Exchange",
+        metrics=[("data size", 1024000)],
+    )
 
     # Build QueryStageExec wrapper — .plan() returns the exchange node
     stage_node = MagicMock()
@@ -566,15 +522,9 @@ def test_collect_metrics_aqe_fallthrough_on_error():
     """If AQE .executedPlan() throws, fall through to normal traversal."""
     from cluster_yield_snapshot._compat import _collect_metrics_recursive
 
-    aqe_node = MagicMock()
-    aqe_node.getClass.return_value.getSimpleName.return_value = "AdaptiveSparkPlanExec"
+    aqe_node = _make_mock_node("AdaptiveSparkPlanExec", node_name="AdaptiveSparkPlan")
+    # Override executedPlan to throw
     aqe_node.executedPlan.side_effect = RuntimeError("not yet executed")
-    aqe_node.nodeName.return_value = "AdaptiveSparkPlan"
-    # No metrics on the wrapper itself
-    aqe_node.metrics.return_value.toSeq.return_value.size.return_value = 0
-    aqe_children = MagicMock()
-    aqe_children.size.return_value = 0
-    aqe_node.children.return_value = aqe_children
 
     collector: list[dict] = []
     _collect_metrics_recursive(aqe_node, collector)
@@ -582,6 +532,67 @@ def test_collect_metrics_aqe_fallthrough_on_error():
     # Falls through to normal — collects the AQE node itself
     assert len(collector) == 1
     assert collector[0]["simpleClassName"] == "AdaptiveSparkPlanExec"
+
+
+def test_extract_node_metrics_with_jvm():
+    """Strategy 1 (JavaConverters via _jvm) should work when jvm is provided."""
+    from cluster_yield_snapshot._compat import _extract_node_metrics
+
+    mock_metric = MagicMock()
+    mock_metric.value.return_value = 77777
+
+    mock_entry = MagicMock()
+    mock_entry.getKey.return_value = "size of files read"
+    mock_entry.getValue.return_value = mock_metric
+
+    mock_iterator = MagicMock()
+    call_count = {"i": 0}
+    def has_next():
+        return call_count["i"] < 1
+    def next_entry():
+        call_count["i"] += 1
+        return mock_entry
+    mock_iterator.hasNext = has_next
+    mock_iterator.next = next_entry
+
+    mock_entry_set = MagicMock()
+    mock_entry_set.iterator.return_value = mock_iterator
+
+    mock_java_map = MagicMock()
+    mock_java_map.entrySet.return_value = mock_entry_set
+
+    mock_converter = MagicMock()
+    mock_converter.asJava.return_value = mock_java_map
+
+    mock_jvm = MagicMock()
+    mock_jvm.scala.collection.JavaConverters.mapAsJavaMapConverter.return_value = mock_converter
+
+    mock_metrics_map = MagicMock()
+    mock_node = MagicMock()
+    mock_node.metrics.return_value = mock_metrics_map
+
+    result = _extract_node_metrics(mock_node, jvm=mock_jvm)
+    assert result["size of files read"] == 77777
+
+
+def test_extract_node_metrics_tostring_fallback():
+    """Strategy 3 (toString parsing) should work when keysIterator fails."""
+    from cluster_yield_snapshot._compat import _extract_node_metrics
+
+    mock_metric = MagicMock()
+    mock_metric.value.return_value = 42
+
+    mock_metrics_map = MagicMock()
+    # keysIterator throws, forcing fallback to toString
+    mock_metrics_map.keysIterator.side_effect = Exception("no keysIterator")
+    mock_metrics_map.toString.return_value = "Map(data size -> SQLMetric(...))"
+    mock_metrics_map.apply = lambda k: mock_metric if k == "data size" else None
+
+    mock_node = MagicMock()
+    mock_node.metrics.return_value = mock_metrics_map
+
+    result = _extract_node_metrics(mock_node, jvm=None)
+    assert result.get("data size") == 42
 
 
 # ── Run all tests ────────────────────────────────────────────────────────

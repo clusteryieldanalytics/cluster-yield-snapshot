@@ -152,6 +152,29 @@ _METRIC_ALIASES: dict[str, str] = {
 }
 
 
+def _get_jvm(df: DataFrame) -> Optional[Any]:
+    """
+    Get the JVM gateway from a DataFrame.
+
+    Tries multiple paths since PySpark versions vary:
+      1. df.sparkSession.sparkContext._jvm  (standard)
+      2. df.sparkSession._sc._jvm           (older PySpark)
+      3. df._sc._jvm                        (fallback)
+    """
+    for accessor in [
+        lambda: df.sparkSession.sparkContext._jvm,
+        lambda: df.sparkSession._sc._jvm,
+        lambda: df._sc._jvm,
+    ]:
+        try:
+            jvm = accessor()
+            if jvm is not None:
+                return jvm
+        except Exception:
+            continue
+    return None
+
+
 def get_plan_metrics(df: DataFrame) -> Optional[list[dict[str, Any]]]:
     """
     Extract runtime SQLMetric values from every node in the executed plan.
@@ -166,8 +189,9 @@ def get_plan_metrics(df: DataFrame) -> Optional[list[dict[str, Any]]]:
     """
     try:
         plan = df._jdf.queryExecution().executedPlan()
+        jvm = _get_jvm(df)
         nodes: list[dict[str, Any]] = []
-        _collect_metrics_recursive(plan, nodes)
+        _collect_metrics_recursive(plan, nodes, jvm)
         # Only return if we got at least one node with actual data
         if any(n.get("metrics") for n in nodes):
             return nodes
@@ -179,6 +203,7 @@ def get_plan_metrics(df: DataFrame) -> Optional[list[dict[str, Any]]]:
 def _collect_metrics_recursive(
     plan_node: Any,
     collector: list[dict[str, Any]],
+    jvm: Optional[Any] = None,
 ) -> None:
     """
     Walk the SparkPlan tree depth-first, extracting metrics from each node.
@@ -217,7 +242,7 @@ def _collect_metrics_recursive(
     if class_name == "AdaptiveSparkPlanExec":
         try:
             final_plan = plan_node.executedPlan()
-            _collect_metrics_recursive(final_plan, collector)
+            _collect_metrics_recursive(final_plan, collector, jvm)
             return
         except Exception:
             pass  # fall through to normal traversal
@@ -227,7 +252,7 @@ def _collect_metrics_recursive(
     if "QueryStageExec" in class_name:
         try:
             stage_plan = plan_node.plan()
-            _collect_metrics_recursive(stage_plan, collector)
+            _collect_metrics_recursive(stage_plan, collector, jvm)
             return
         except Exception:
             pass  # fall through to normal traversal
@@ -243,7 +268,7 @@ def _collect_metrics_recursive(
         "simpleClassName": class_name,
     }
 
-    metrics = _extract_node_metrics(plan_node)
+    metrics = _extract_node_metrics(plan_node, jvm)
     if metrics:
         node_info["metrics"] = metrics
 
@@ -254,22 +279,37 @@ def _collect_metrics_recursive(
         children = plan_node.children()
         size = children.size()
         for i in range(size):
-            _collect_metrics_recursive(children.apply(i), collector)
+            _collect_metrics_recursive(children.apply(i), collector, jvm)
     except Exception:
         pass
 
 
-def _extract_node_metrics(plan_node: Any) -> dict[str, int]:
+def _extract_node_metrics(
+    plan_node: Any, jvm: Optional[Any] = None
+) -> dict[str, int]:
     """
     Extract the metrics map from a single SparkPlan node.
 
-    Tries two JVM iteration strategies:
-      1. Scala .toSeq() — works on most Spark/Databricks versions
-      2. JavaConverters — fallback for environments where .toSeq() fails
+    Tries three strategies in order of reliability:
+
+      1. **JavaConverters via _jvm** — Convert the Scala Map to a
+         java.util.Map using the JVM gateway, then iterate the Java
+         entrySet with a standard Java Iterator.  Most reliable when
+         ``_jvm`` is available.
+
+      2. **keysIterator + apply** — Use the Scala Map's own
+         ``keysIterator()`` (which extends java.util.Iterator) to get
+         each key, then look up each metric with ``.apply(key)``.
+
+      3. **toString parsing** — Call ``toString()`` on the Scala Map
+         (always works through py4j) and regex-parse the metric names.
+         Then look up each metric by name and read its ``.value()``.
 
     Returns only non-zero metrics. Canonicalizes Photon/Databricks
-    metric names via _METRIC_ALIASES.
+    metric names via ``_METRIC_ALIASES``.
     """
+    import re
+
     metrics: dict[str, int] = {}
 
     try:
@@ -277,15 +317,40 @@ def _extract_node_metrics(plan_node: Any) -> dict[str, int]:
     except Exception:
         return metrics
 
-    # Strategy 1: iterate via .toSeq()
+    # ── Strategy 1: JavaConverters via _jvm ───────────────────────────
+    if jvm is not None:
+        try:
+            java_map = (
+                jvm.scala.collection.JavaConverters
+                .mapAsJavaMapConverter(metrics_map)
+                .asJava()
+            )
+            it = java_map.entrySet().iterator()
+            while it.hasNext():
+                entry = it.next()
+                name = str(entry.getKey())
+                try:
+                    value = int(entry.getValue().value())
+                    if value != 0:
+                        canonical = _METRIC_ALIASES.get(name, name)
+                        metrics[canonical] = value
+                except Exception:
+                    pass
+            return metrics
+        except Exception:
+            pass
+
+    # ── Strategy 2: keysIterator + apply ──────────────────────────────
+    # Scala's Iterator extends java.util.Iterator, so hasNext/next work
+    # through py4j.  Map.apply(key) looks up a single entry.
     try:
-        seq = metrics_map.toSeq()
-        size = seq.size()
-        for i in range(size):
-            pair = seq.apply(i)
-            name = str(pair._1())
+        keys_iter = metrics_map.keysIterator()
+        while keys_iter.hasNext():
+            key = keys_iter.next()
+            name = str(key)
             try:
-                value = int(pair._2().value())
+                metric = metrics_map.apply(key)
+                value = int(metric.value())
                 if value != 0:
                     canonical = _METRIC_ALIASES.get(name, name)
                     metrics[canonical] = value
@@ -295,19 +360,20 @@ def _extract_node_metrics(plan_node: Any) -> dict[str, int]:
     except Exception:
         pass
 
-    # Strategy 2: JavaConverters fallback (Scala 2.12 / Databricks)
+    # ── Strategy 3: toString parsing ──────────────────────────────────
+    # metrics_map.toString() returns something like:
+    #   "Map(number of output rows -> ..., size of files read -> ...)"
+    # We extract the key names, then look up each metric individually.
     try:
-        # Access the JVM gateway through the py4j bridge
-        gateway = plan_node._gateway  # type: ignore[attr-defined]
-        java_map = (
-            gateway.jvm.scala.collection.JavaConverters
-            .mapAsJavaMapConverter(metrics_map)
-            .asJava()
-        )
-        for name_obj, metric_obj in java_map.items():
-            name = str(name_obj)
+        map_str = str(metrics_map.toString())
+        # Extract keys from "Map(key1 -> ..., key2 -> ...)"
+        # Keys are the text before each " -> "
+        key_pattern = re.findall(r"(?:Map\(|, )([^,]+?) -> ", map_str)
+        for name in key_pattern:
+            name = name.strip()
             try:
-                value = int(metric_obj.value())
+                metric = metrics_map.apply(name)
+                value = int(metric.value())
                 if value != 0:
                     canonical = _METRIC_ALIASES.get(name, name)
                     metrics[canonical] = value
