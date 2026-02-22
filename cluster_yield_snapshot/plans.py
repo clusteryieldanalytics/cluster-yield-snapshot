@@ -55,7 +55,8 @@ def capture_plan(df: DataFrame, label: str, sql: Optional[str] = None) -> dict[s
       - label, fingerprint, nodeCount
       - plan (JSON array) or planText (text explain)
       - planFormat ("json" or "text")
-      - metrics (list of per-node runtime metrics, if post-execution)
+      - planDetails (structured metadata parsed from text plan detail sections)
+      - metrics (list of per-node runtime metrics, if post-execution on classic PySpark)
       - sql (if provided)
 
     Raises nothing — returns a partial entry on failure.
@@ -99,15 +100,18 @@ def capture_plan(df: DataFrame, label: str, sql: Optional[str] = None) -> dict[s
 
     if plan_text:
         entry["planText"] = plan_text
+        # Parse structured metadata from the numbered detail sections.
+        # This is the primary cost-estimation data source on Spark Connect
+        # (where JVM metrics are unavailable).
+        details = parse_plan_details(plan_text)
+        if details.get("nodes"):
+            entry["planDetails"] = details
 
     if sql:
         entry["sql"] = sql
 
     # Runtime metrics — only populated post-execution on classic PySpark.
-    # Pre-execution captures (trigger="spark.sql") will get None here,
-    # which is correct — the job hasn't run yet. The dedup logic in
-    # CYSnapshot._on_plan_captured replaces pre-execution entries with
-    # post-execution ones, so metrics arrive with the final capture.
+    # Returns None on Spark Connect (no JVM access).
     metrics = _compat.get_plan_metrics(df)
     if metrics:
         entry["metrics"] = metrics
@@ -275,6 +279,429 @@ def tables_from_entry(plan_entry: dict[str, Any]) -> set[str]:
     if plan_text:
         return tables_from_text(plan_text)
     return set()
+
+
+# ── Detail section parsing ──────────────────────────────────────────────
+#
+# The EXPLAIN text has two parts:
+#   A) The tree section (operators with +-, :- connectors)
+#   B) The numbered detail sections: "(N) OperatorName\n  Key: value\n..."
+#
+# Section B is where cost-relevant metadata lives — filters, schemas,
+# join keys, exchange types.  On Spark Connect (no JVM), this is the
+# ONLY source of structured plan data.
+
+_NODE_HEADER = re.compile(r"^\((\d+)\)\s+(.+)")
+_OUTPUT_COLS = re.compile(r"^Output\s+\[(\d+)\]:\s+\[(.+)\]")
+_READ_SCHEMA = re.compile(r"^ReadSchema:\s+struct<(.+)>")
+_FILTER_LINE = re.compile(
+    r"^(PartitionFilters|DataFilters|RequiredDataFilters|"
+    r"DictionaryFilters|OptionalDataFilters|PushedFilters):\s+\[(.+)\]"
+)
+_JOIN_TYPE = re.compile(r"^Join type:\s+(\w+)")
+_JOIN_KEYS = re.compile(r"^(Left|Right) keys\s+\[\d+\]:\s+\[(.+)\]")
+_JOIN_COND = re.compile(r"^Join condition:\s+(.+)")
+_ARGUMENTS = re.compile(r"^Arguments:\s+(.+)")
+_LOCATION = re.compile(r"^Location:\s+(\w+)\s+\[(.+)\]")
+
+
+def parse_plan_details(explain_text: str) -> dict[str, Any]:
+    """
+    Parse the numbered detail sections from EXPLAIN output into structured data.
+
+    Returns a dict with:
+      - ``nodes``: dict mapping node ID → per-node metadata
+      - ``scans``: list of scan summaries (table, format, column count, filters)
+      - ``joins``: list of join summaries (strategy, type, keys)
+      - ``exchanges``: list of exchange summaries (type, partitioning)
+      - ``photonEnabled``: bool — all operators use Photon
+      - ``aqeFinalPlan``: bool — whether this is the final AQE plan
+
+    Works on both OSS Spark and Databricks Photon plan text.
+    Returns ``{"nodes": {}}`` if no detail sections are found.
+    """
+    # Find where the detail sections start
+    detail_text = _extract_detail_section(explain_text)
+    if not detail_text:
+        return {"nodes": {}}
+
+    # Parse into per-node blocks
+    nodes: dict[str, dict[str, Any]] = {}
+    current_id: Optional[str] = None
+    current_lines: list[str] = []
+
+    for line in detail_text.split("\n"):
+        header = _NODE_HEADER.match(line)
+        if header:
+            # Flush previous node
+            if current_id is not None:
+                nodes[current_id] = _parse_node_block(
+                    current_id, current_lines
+                )
+            current_id = header.group(1)
+            current_lines = [line]
+        elif current_id is not None:
+            current_lines.append(line)
+
+    # Flush last node
+    if current_id is not None:
+        nodes[current_id] = _parse_node_block(current_id, current_lines)
+
+    # Build typed summary lists
+    scans: list[dict[str, Any]] = []
+    joins: list[dict[str, Any]] = []
+    exchanges: list[dict[str, Any]] = []
+    photon_count = 0
+
+    for nid, node in nodes.items():
+        op = node.get("operator", "")
+        if "Photon" in op:
+            photon_count += 1
+
+        if "Scan" in op:
+            scan: dict[str, Any] = {"nodeId": nid, "operator": op}
+            for key in ("table", "format", "readColumnCount", "outputCount",
+                        "hasPartitionFilter", "hasDataFilter",
+                        "partitionFilters", "dataFilters",
+                        "dictionaryFilters", "readSchema"):
+                if key in node:
+                    scan[key] = node[key]
+            scans.append(scan)
+        elif "Join" in op:
+            join: dict[str, Any] = {"nodeId": nid, "operator": op}
+            # Infer strategy from operator name
+            if "BroadcastHash" in op:
+                join["strategy"] = "BroadcastHashJoin"
+            elif "SortMerge" in op:
+                join["strategy"] = "SortMergeJoin"
+            elif "ShuffledHash" in op:
+                join["strategy"] = "ShuffledHashJoin"
+            elif "NestedLoop" in op or "Cartesian" in op:
+                join["strategy"] = "NestedLoopJoin"
+            for key in ("joinType", "leftKeys", "rightKeys", "joinCondition"):
+                if key in node:
+                    join[key] = node[key]
+            joins.append(join)
+        elif "Exchange" in op or "Shuffle" in op:
+            exch: dict[str, Any] = {"nodeId": nid, "operator": op}
+            for key in ("exchangeType", "partitioning", "partitionKeys",
+                        "numPartitions"):
+                if key in node:
+                    exch[key] = node[key]
+            exchanges.append(exch)
+
+    # Detect AQE status from tree section
+    aqe_final = False
+    if "isFinalPlan=true" in explain_text:
+        aqe_final = True
+
+    # Detect Photon
+    photon_enabled = photon_count > 0 and all(
+        "Photon" in n.get("operator", "")
+        or n.get("operator", "") in ("AdaptiveSparkPlan", "ColumnarToRow")
+        for n in nodes.values()
+    )
+
+    return {
+        "nodes": nodes,
+        "scans": scans,
+        "joins": joins,
+        "exchanges": exchanges,
+        "photonEnabled": photon_enabled,
+        "aqeFinalPlan": aqe_final,
+    }
+
+
+def _extract_detail_section(explain_text: str) -> str:
+    """
+    Extract the numbered detail section from EXPLAIN text.
+
+    This is everything after the tree section, starting from the first
+    line matching ``(N) OperatorName``.  Stops at section headers like
+    ``== Photon Explanation ==``.
+    """
+    lines = explain_text.split("\n")
+    start = None
+    for i, line in enumerate(lines):
+        if _NODE_HEADER.match(line):
+            start = i
+            break
+    if start is None:
+        return ""
+
+    detail_lines: list[str] = []
+    for line in lines[start:]:
+        if line.startswith("== ") and line.endswith(" =="):
+            break
+        detail_lines.append(line)
+    return "\n".join(detail_lines)
+
+
+def _parse_node_block(
+    node_id: str, lines: list[str]
+) -> dict[str, Any]:
+    """Parse a single numbered node block into structured metadata."""
+    node: dict[str, Any] = {}
+
+    # First line is the header: "(N) OperatorName rest..."
+    header = _NODE_HEADER.match(lines[0])
+    if header:
+        full_op = header.group(2).strip()
+        # Parse operator name and optional format/table from scans
+        # e.g. "PhotonScan parquet workspace.test_cy.orders"
+        # e.g. "FileScan parquet default.orders[col1, col2]"
+        parts = full_op.split()
+        node["operator"] = parts[0] if parts else full_op
+        if len(parts) >= 3 and "Scan" in parts[0]:
+            node["format"] = parts[1]
+            # Table name — strip trailing [...] if present
+            table = parts[2].split("[")[0].strip("`")
+            node["table"] = table
+        elif len(parts) >= 2 and "Scan" in parts[0]:
+            # Could be format or table
+            second = parts[1]
+            if second in ("parquet", "orc", "delta", "csv", "json", "avro"):
+                node["format"] = second
+            else:
+                node["table"] = second.split("[")[0].strip("`")
+        # Join type from header: "PhotonBroadcastHashJoin Inner"
+        if "Join" in (parts[0] if parts else ""):
+            for p in parts[1:]:
+                if p in ("Inner", "LeftOuter", "RightOuter", "FullOuter",
+                         "LeftSemi", "LeftAnti", "Cross"):
+                    node["joinType"] = p
+
+    # Parse attribute lines
+    for line in lines[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Output columns
+        m = _OUTPUT_COLS.match(stripped)
+        if m:
+            node["outputCount"] = int(m.group(1))
+            cols = _parse_column_refs(m.group(2))
+            if cols:
+                node["output"] = cols
+            continue
+
+        # ReadSchema
+        m = _READ_SCHEMA.match(stripped)
+        if m:
+            schema = _parse_struct_schema(m.group(1))
+            if schema:
+                node["readSchema"] = schema
+                node["readColumnCount"] = len(schema)
+            continue
+
+        # Filter lines (partition, data, dictionary, optional, pushed)
+        m = _FILTER_LINE.match(stripped)
+        if m:
+            filter_type = m.group(1)
+            filters = _parse_filter_list(m.group(2))
+            key_map = {
+                "PartitionFilters": "partitionFilters",
+                "DataFilters": "dataFilters",
+                "RequiredDataFilters": "dataFilters",
+                "DictionaryFilters": "dictionaryFilters",
+                "OptionalDataFilters": "optionalDataFilters",
+                "PushedFilters": "pushedFilters",
+            }
+            key = key_map.get(filter_type, filter_type)
+            existing = node.get(key, [])
+            # Merge RequiredDataFilters into dataFilters
+            node[key] = existing + filters if existing else filters
+            if filter_type == "PartitionFilters" and filters:
+                node["hasPartitionFilter"] = True
+            if filter_type in ("DataFilters", "RequiredDataFilters",
+                               "DictionaryFilters") and filters:
+                node["hasDataFilter"] = True
+            continue
+
+        # Join type (from detail line)
+        m = _JOIN_TYPE.match(stripped)
+        if m:
+            node["joinType"] = m.group(1)
+            continue
+
+        # Join keys
+        m = _JOIN_KEYS.match(stripped)
+        if m:
+            side = m.group(1).lower() + "Keys"
+            node[side] = _parse_column_refs(m.group(2))
+            continue
+
+        # Join condition
+        m = _JOIN_COND.match(stripped)
+        if m:
+            cond = m.group(1).strip()
+            node["joinCondition"] = None if cond == "None" else cond
+            continue
+
+        # Arguments (exchanges and aggregations)
+        m = _ARGUMENTS.match(stripped)
+        if m:
+            args = m.group(1).strip()
+            _parse_arguments(args, node)
+            continue
+
+        # Location
+        m = _LOCATION.match(stripped)
+        if m:
+            node["locationIndex"] = m.group(1)
+            node["locationPath"] = m.group(2)
+            continue
+
+    # Ensure boolean flags default to False for scans
+    if "Scan" in node.get("operator", ""):
+        node.setdefault("hasPartitionFilter", False)
+        node.setdefault("hasDataFilter", False)
+
+    return node
+
+
+def _parse_column_refs(col_str: str) -> list[str]:
+    """Parse column references like 'user_id#123L, amount#456' → ['user_id', 'amount']."""
+    cols: list[str] = []
+    for part in col_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        # Strip Spark's internal ref suffix: #123, #123L, etc.
+        name = re.split(r"#\d+", part)[0].strip()
+        if name:
+            cols.append(name)
+    return cols
+
+
+def _parse_struct_schema(schema_str: str) -> dict[str, str]:
+    """Parse 'user_id:bigint,amount:decimal(10,2)' → {'user_id': 'bigint', ...}."""
+    schema: dict[str, str] = {}
+    # Split carefully — types like decimal(10,2) contain commas
+    depth = 0
+    current = ""
+    for ch in schema_str:
+        if ch in ("(", "<"):
+            depth += 1
+            current += ch
+        elif ch in (")", ">"):
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            _add_schema_field(current.strip(), schema)
+            current = ""
+        else:
+            current += ch
+    if current.strip():
+        _add_schema_field(current.strip(), schema)
+    return schema
+
+
+def _add_schema_field(field: str, schema: dict[str, str]) -> None:
+    """Parse 'name:type' and add to schema dict."""
+    parts = field.split(":", 1)
+    if len(parts) == 2:
+        schema[parts[0].strip()] = parts[1].strip()
+
+
+def _parse_filter_list(filter_str: str) -> list[str]:
+    """Parse '[expr1, expr2, ...]' contents into individual expressions."""
+    # Filters are comma-separated but expressions can contain commas
+    # inside parentheses.  Split at top-level commas only.
+    filters: list[str] = []
+    depth = 0
+    current = ""
+    for ch in filter_str:
+        if ch in ("(", "["):
+            depth += 1
+            current += ch
+        elif ch in (")", "]"):
+            depth -= 1
+            current += ch
+        elif ch == "," and depth == 0:
+            expr = current.strip()
+            if expr:
+                filters.append(expr)
+            current = ""
+        else:
+            current += ch
+    expr = current.strip()
+    if expr:
+        filters.append(expr)
+    return filters
+
+
+def _parse_arguments(args: str, node: dict[str, Any]) -> None:
+    """
+    Parse an Arguments line into node metadata.
+
+    Handles patterns like:
+      - "hashpartitioning(category#123, country#456, 16)"
+      - "SinglePartition"
+      - "EXECUTOR_BROADCAST, [id=#1234]"
+      - "rangepartitioning(amount#789 ASC, 200)"
+    """
+    if args.startswith("hashpartitioning("):
+        node["exchangeType"] = "shuffle"
+        node["partitioning"] = "hashpartitioning"
+        inner = args[len("hashpartitioning("):-1] if args.endswith(")") else args
+        parts = [p.strip() for p in inner.split(",")]
+        # Last element is numPartitions (an integer)
+        keys: list[str] = []
+        for p in parts:
+            # Is it a number (partition count)?
+            stripped = p.strip()
+            if stripped.isdigit():
+                node["numPartitions"] = int(stripped)
+            else:
+                name = re.split(r"#\d+", stripped)[0].strip()
+                if name:
+                    keys.append(name)
+        if keys:
+            node["partitionKeys"] = keys
+    elif args.startswith("rangepartitioning("):
+        node["exchangeType"] = "shuffle"
+        node["partitioning"] = "rangepartitioning"
+        inner = args[len("rangepartitioning("):-1] if args.endswith(")") else args
+        parts = [p.strip() for p in inner.split(",")]
+        for p in parts:
+            if p.strip().isdigit():
+                node["numPartitions"] = int(p.strip())
+    elif "SinglePartition" in args:
+        node["exchangeType"] = "broadcast"
+        node["partitioning"] = "SinglePartition"
+    elif "EXECUTOR_BROADCAST" in args or "BROADCAST" in args:
+        node["exchangeType"] = "broadcast"
+    elif "roundrobinpartitioning" in args.lower():
+        node["exchangeType"] = "shuffle"
+        node["partitioning"] = "roundrobinpartitioning"
+
+
+# ── Plan detail accessors ───────────────────────────────────────────────
+#
+# Convenience functions for the server-side cost estimator and quick_scan.
+
+
+def scans_from_entry(plan_entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return scan details from planDetails."""
+    return plan_entry.get("planDetails", {}).get("scans", [])
+
+
+def joins_from_entry(plan_entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return join details from planDetails."""
+    return plan_entry.get("planDetails", {}).get("joins", [])
+
+
+def exchanges_from_entry(plan_entry: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return exchange details from planDetails."""
+    return plan_entry.get("planDetails", {}).get("exchanges", [])
+
+
+def has_plan_details(plan_entry: dict[str, Any]) -> bool:
+    """Return True if this plan entry has parsed detail metadata."""
+    details = plan_entry.get("planDetails", {})
+    return bool(details.get("nodes"))
 
 
 # ── Runtime metric accessors ─────────────────────────────────────────────

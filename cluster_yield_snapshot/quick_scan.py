@@ -10,9 +10,10 @@ from __future__ import annotations
 from typing import Any
 
 from .plans import (
-    operators_from_entry, has_metrics,
+    operators_from_entry, has_metrics, has_plan_details,
     scan_bytes_from_entry, scan_rows_from_entry, scan_files_from_entry,
     shuffle_bytes_from_entry,
+    scans_from_entry, joins_from_entry, exchanges_from_entry,
 )
 from ._util import fmt_bytes, parse_int
 
@@ -48,7 +49,7 @@ def quick_scan(
                     f"quadratic join, check for missing equi-condition"
                 )
 
-        # Runtime metric teasers (post-execution captures only)
+        # Runtime metric teasers (classic PySpark post-execution only)
         if has_metrics(p):
             scan_b = scan_bytes_from_entry(p)
             scan_r = scan_rows_from_entry(p)
@@ -69,6 +70,10 @@ def quick_scan(
                 teasers.append(
                     f"`{short_label}` shuffled {fmt_bytes(shuf_b)}"
                 )
+
+        # Plan detail teasers (Spark Connect and classic — from text plan)
+        if has_plan_details(p):
+            _teasers_from_details(p, tables, teasers)
 
     # Broadcast disabled check
     if threshold is not None and threshold <= 0:
@@ -102,3 +107,57 @@ def quick_scan(
             )
 
     return teasers
+
+
+def _teasers_from_details(
+    plan_entry: dict[str, Any],
+    tables: dict[str, dict[str, Any]],
+    teasers: list[str],
+) -> None:
+    """Generate teasers from parsed plan detail metadata."""
+    scans = scans_from_entry(plan_entry)
+    joins = joins_from_entry(plan_entry)
+    exchanges = exchanges_from_entry(plan_entry)
+
+    for scan in scans:
+        table = scan.get("table", "")
+        short_table = table.rsplit(".", 1)[-1] if "." in table else table
+        cols = scan.get("readColumnCount", 0)
+
+        # Column pruning: compare read columns to catalog total
+        cat = tables.get(table, {})
+        total_cols = cat.get("columnCount")
+        if cols and total_cols and cols < total_cols:
+            teasers.append(
+                f"`{short_table}` reads {cols} of {total_cols} columns"
+            )
+
+        # Missing partition filter on partitioned table
+        if not scan.get("hasPartitionFilter"):
+            part_cols = cat.get("partitionColumns", [])
+            if part_cols:
+                teasers.append(
+                    f"`{short_table}` scanned without partition filter "
+                    f"(partitioned by {', '.join(part_cols)})"
+                )
+
+    # Join summaries
+    smj_count = sum(1 for j in joins if j.get("strategy") == "SortMergeJoin")
+    if smj_count:
+        teasers.append(
+            f"{smj_count} SortMergeJoin{'s' if smj_count > 1 else ''} "
+            f"— each requires 2 shuffles + 2 sorts"
+        )
+
+    # Shuffle partition count check
+    for exch in exchanges:
+        n = exch.get("numPartitions")
+        if n is not None and n <= 1 and exch.get("exchangeType") == "shuffle":
+            teasers.append(
+                f"Shuffle to {n} partition — single-partition bottleneck"
+            )
+
+    # Photon status
+    details = plan_entry.get("planDetails", {})
+    if details.get("photonEnabled"):
+        teasers.append("Photon enabled — all operators accelerated")

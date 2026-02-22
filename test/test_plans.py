@@ -7,6 +7,8 @@ from cluster_yield_snapshot.plans import (
     has_metrics, metrics_summary,
     scan_bytes_from_entry, scan_rows_from_entry, scan_files_from_entry,
     shuffle_bytes_from_entry, broadcast_bytes_from_entry,
+    parse_plan_details, has_plan_details,
+    scans_from_entry, joins_from_entry, exchanges_from_entry,
 )
 from cluster_yield_snapshot._util import fmt_bytes, parse_int
 
@@ -334,6 +336,189 @@ def test_photon_metric_classnames():
     assert scan_bytes_from_entry(photon_entry) == 100_000_000
     assert scan_rows_from_entry(photon_entry) == 500_000
     assert shuffle_bytes_from_entry(photon_entry) == 5_000_000
+
+
+# ── parse_plan_details tests ─────────────────────────────────────────────
+
+def test_details_photon_scans():
+    """Photon plan should produce scan details with table, format, filters."""
+    d = parse_plan_details(PHOTON_PLAN)
+    assert d["nodes"], "Should have parsed nodes"
+    scans = d["scans"]
+    assert len(scans) == 3
+    tables = {s["table"] for s in scans}
+    assert "workspace.test_cy.orders" in tables
+    assert "workspace.test_cy.users" in tables
+    assert "workspace.test_cy.products" in tables
+
+
+def test_details_photon_orders_scan_metadata():
+    """Orders scan should have partition filter, data filter, readSchema."""
+    d = parse_plan_details(PHOTON_PLAN)
+    orders = [s for s in d["scans"] if "orders" in s.get("table", "")][0]
+    assert orders["format"] == "parquet"
+    assert orders["hasPartitionFilter"] is True
+    assert orders["hasDataFilter"] is True
+    assert orders.get("readColumnCount", 0) == 4  # ReadSchema has 4 cols
+
+
+def test_details_photon_users_scan_no_partition_filter():
+    """Users scan should NOT have a partition filter."""
+    d = parse_plan_details(PHOTON_PLAN)
+    users = [s for s in d["scans"] if "users" in s.get("table", "")][0]
+    assert users["hasPartitionFilter"] is False
+
+
+def test_details_photon_enabled():
+    """Photon plan should detect photonEnabled."""
+    d = parse_plan_details(PHOTON_PLAN)
+    assert d["photonEnabled"] is True
+
+
+def test_details_no_detail_section():
+    """Plan without numbered details should return empty nodes."""
+    d = parse_plan_details(EXPLAIN_EXTENDED)
+    assert d["nodes"] == {}
+
+
+def test_details_scans_from_entry():
+    """scans_from_entry should return scans from planDetails."""
+    entry = {"planDetails": parse_plan_details(PHOTON_PLAN)}
+    scans = scans_from_entry(entry)
+    assert len(scans) == 3
+
+
+def test_details_has_plan_details():
+    """has_plan_details should check for non-empty nodes."""
+    entry_with = {"planDetails": parse_plan_details(PHOTON_PLAN)}
+    entry_without = {"planDetails": {"nodes": {}}}
+    assert has_plan_details(entry_with) is True
+    assert has_plan_details(entry_without) is False
+    assert has_plan_details({}) is False
+
+
+def test_details_read_schema_parsing():
+    """ReadSchema should be parsed into column name:type dict."""
+    d = parse_plan_details(PHOTON_PLAN)
+    # Node 1 is orders scan
+    orders_node = d["nodes"].get("1", {})
+    schema = orders_node.get("readSchema", {})
+    assert "user_id" in schema
+    assert schema["user_id"] == "bigint"
+    assert "amount" in schema
+    assert "decimal" in schema["amount"]
+
+
+def test_details_output_columns():
+    """Output columns should be parsed from detail section."""
+    d = parse_plan_details(PHOTON_PLAN)
+    orders_node = d["nodes"].get("1", {})
+    assert orders_node.get("outputCount") == 5
+    output = orders_node.get("output", [])
+    assert "user_id" in output
+    assert "amount" in output
+
+
+def test_details_partition_filters():
+    """PartitionFilters should be parsed into a list."""
+    d = parse_plan_details(PHOTON_PLAN)
+    orders_node = d["nodes"].get("1", {})
+    pf = orders_node.get("partitionFilters", [])
+    assert len(pf) >= 1
+    # Should contain the date filter
+    assert any("order_date" in f for f in pf)
+
+
+OSS_SPARK_PLAN = """\
+== Physical Plan ==
+AdaptiveSparkPlan isFinalPlan=false
++- HashAggregate(keys=[region#10], functions=[sum(amount#11)])
+   +- Exchange hashpartitioning(region#10, 200)
+      +- HashAggregate(keys=[region#10], functions=[partial_sum(amount#11)])
+         +- FileScan parquet default.orders[region#10,amount#11]
+
+(5) FileScan parquet default.orders
+Output [2]: [region#10, amount#11]
+PartitionFilters: []
+DataFilters: []
+ReadSchema: struct<region:string,amount:decimal(10,2)>
+Location: InMemoryFileIndex [s3://warehouse/orders]
+"""
+
+def test_details_oss_spark_scan():
+    """OSS Spark plan with FileScan should parse correctly."""
+    d = parse_plan_details(OSS_SPARK_PLAN)
+    assert len(d["scans"]) == 1
+    scan = d["scans"][0]
+    assert scan["table"] == "default.orders"
+    assert scan["format"] == "parquet"
+    assert scan["readColumnCount"] == 2
+    # Empty partition filters still means hasPartitionFilter = False
+    assert scan["hasPartitionFilter"] is False
+
+
+def test_details_oss_spark_aqe_status():
+    """isFinalPlan=false should be detected."""
+    d = parse_plan_details(OSS_SPARK_PLAN)
+    assert d["aqeFinalPlan"] is False
+
+
+SMJ_PLAN = """\
+== Physical Plan ==
+AdaptiveSparkPlan isFinalPlan=true
++- SortMergeJoin [user_id#1L], [user_id#2L], Inner
+   :- Sort [user_id#1L ASC]
+   :  +- Exchange hashpartitioning(user_id#1L, 200)
+   :     +- FileScan parquet default.orders[user_id#1L]
+   +- Sort [user_id#2L ASC]
+      +- Exchange hashpartitioning(user_id#2L, 200)
+         +- FileScan parquet default.users[user_id#2L]
+
+(3) SortMergeJoin
+Left keys [1]: [user_id#1L]
+Right keys [1]: [user_id#2L]
+Join type: Inner
+Join condition: None
+
+(5) Exchange
+Arguments: hashpartitioning(user_id#1L, 200)
+
+(8) Exchange
+Arguments: hashpartitioning(user_id#2L, 200)
+"""
+
+def test_details_smj_join():
+    """SortMergeJoin should be parsed with keys and type."""
+    d = parse_plan_details(SMJ_PLAN)
+    assert len(d["joins"]) == 1
+    join = d["joins"][0]
+    assert join["strategy"] == "SortMergeJoin"
+    assert join.get("joinType") == "Inner"
+    left_keys = d["nodes"]["3"].get("leftKeys", [])
+    assert "user_id" in left_keys
+
+
+def test_details_smj_exchanges():
+    """Exchange nodes should parse hashpartitioning arguments."""
+    d = parse_plan_details(SMJ_PLAN)
+    exchanges = d["exchanges"]
+    assert len(exchanges) == 2
+    for exch in exchanges:
+        assert exch.get("exchangeType") == "shuffle"
+        assert exch.get("numPartitions") == 200
+
+
+def test_details_aqe_final_true():
+    """isFinalPlan=true should be detected."""
+    d = parse_plan_details(SMJ_PLAN)
+    assert d["aqeFinalPlan"] is True
+
+
+def test_details_empty_input():
+    """Empty string should return empty nodes."""
+    d = parse_plan_details("")
+    assert d["nodes"] == {}
+    assert d.get("scans", []) == []
 
 if __name__ == "__main__":
     tests = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
