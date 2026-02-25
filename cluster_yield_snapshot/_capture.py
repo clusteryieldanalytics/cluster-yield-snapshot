@@ -142,9 +142,59 @@ def _merge_line_dicts(
 
 def serialize_construction_lines(
     lines: dict[str, set[int]],
-) -> dict[str, list[int]]:
-    """Convert _cy_lines to JSON-serializable format (sorted lists)."""
-    return {k: sorted(v) for k, v in lines.items() if v}
+) -> list[dict[str, Any]]:
+    """
+    Convert _cy_lines to JSON-serializable construction line entries.
+
+    Returns a list of entries, each with either:
+      - {"file": "...", "lines": [sorted ints]}
+            For absolute file line numbers (local scripts, utility modules)
+      - {"cellFingerprint": "...", "lines": [sorted ints]}
+            For Databricks cells (cell-relative line numbers).
+            The server matches the fingerprint against the notebook
+            source from git to compute the cell's offset.
+
+    Multiple entries from the same Databricks cell are merged by
+    fingerprint. If fingerprinting fails (file unreadable), the
+    entry is silently dropped — partial data is better than bad data.
+    """
+    from ._provenance import is_databricks_cell_path, compute_cell_fingerprint
+
+    # Separate cell paths from regular file paths.
+    # Cell paths get fingerprinted; file paths pass through directly.
+    cell_groups: dict[str, set[int]] = {}   # fingerprint → lines
+    file_groups: dict[str, set[int]] = {}   # filepath → lines
+
+    for path, line_set in lines.items():
+        if not line_set:
+            continue
+
+        if is_databricks_cell_path(path):
+            fp = compute_cell_fingerprint(path)
+            if fp is not None:
+                if fp in cell_groups:
+                    cell_groups[fp] |= line_set
+                else:
+                    cell_groups[fp] = set(line_set)
+            # If fingerprint fails, entry is dropped (file was deleted)
+        else:
+            if path in file_groups:
+                file_groups[path] |= line_set
+            else:
+                file_groups[path] = set(line_set)
+
+    result: list[dict[str, Any]] = []
+    for fp in sorted(cell_groups):
+        result.append({
+            "cellFingerprint": fp,
+            "lines": sorted(cell_groups[fp]),
+        })
+    for path in sorted(file_groups):
+        result.append({
+            "file": path,
+            "lines": sorted(file_groups[path]),
+        })
+    return result
 
 
 class CapturedPlan:

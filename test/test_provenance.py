@@ -12,6 +12,8 @@ from cluster_yield_snapshot._provenance import (
     detect_source_path,
     extract_trigger_info,
     get_current_user_line,
+    compute_cell_fingerprint,
+    is_databricks_cell_path,
     _detect_databricks_dbutils_path,
     _detect_databricks_spark_conf_path,
     _detect_caller_path,
@@ -21,6 +23,8 @@ from cluster_yield_snapshot._provenance import (
     _walk_frames,
     _extract_user_frames,
     _find_trigger_line,
+    _ensure_cell_cached,
+    _cell_source_cache,
 )
 from cluster_yield_snapshot._capture import (
     PassiveCapture,
@@ -218,7 +222,7 @@ def _make_frame(filename, lineno, parent=None):
 
 
 def test_walk_frames_databricks_cell():
-    """Should find Databricks cell frame and normalize to source_path."""
+    """Should find Databricks cell frame and return raw path for fingerprinting."""
     cell = _make_frame(
         "/home/spark-UUID/.ipykernel/3322/command-123-456", 10
     )
@@ -230,18 +234,17 @@ def test_walk_frames_databricks_cell():
         infra,
         "/Workspace/Users/team@co.com/order_report"
     )
-    # Should return source_path (normalized), not the temp path
-    assert result == ("/Workspace/Users/team@co.com/order_report", 10)
+    # Returns raw cell path — serializer will fingerprint it later
+    assert result == ("/home/spark-UUID/.ipykernel/3322/command-123-456", 10)
 
 
 def test_walk_frames_databricks_cell_no_source_path():
-    """Without source_path, cell frame still found but uses raw path."""
+    """Without source_path, cell frame still found with raw path."""
     cell = _make_frame(
         "/home/spark-UUID/.ipykernel/3322/command-123-456", 10
     )
     result = _walk_frames(cell, None)
-    assert result is not None
-    assert result[1] == 10
+    assert result == ("/home/spark-UUID/.ipykernel/3322/command-123-456", 10)
 
 
 def test_walk_frames_skips_databricks_infra():
@@ -261,7 +264,7 @@ def test_walk_frames_skips_databricks_infra():
         launcher,
         "/Workspace/Users/team@co.com/nb"
     )
-    assert result == ("/Workspace/Users/team@co.com/nb", 5)
+    assert result == ("/home/spark-UUID/.ipykernel/3322/command-123-456", 5)
 
 
 def test_walk_frames_local_script():
@@ -314,16 +317,23 @@ def test_extract_trigger_info_with_source_path():
 
 def test_find_trigger_line_databricks_real_stack():
     """Simulates the actual Databricks stack trace."""
-    frames = traceback.StackSummary.from_list([
-        ("/home/spark-UUID/.ipykernel/3322/command-123-456", 10, "<module>", "df.collect()"),
-        ("/databricks/python/lib/python3.12/site-packages/IPython/core/interactiveshell.py", 3602, "run_code", "..."),
-        ("/databricks/python_shell/scripts/db_ipykernel_launcher.py", 48, "main", "..."),
-    ])
-    line = _find_trigger_line(
-        frames,
-        "/Workspace/Users/team@co.com/order_report"
-    )
-    assert line == 10
+    cell_path = "/home/spark-UUID/.ipykernel/3322/command-123-456"
+    _cell_source_cache[cell_path] = "df.collect()\n"
+    try:
+        frames = traceback.StackSummary.from_list([
+            (cell_path, 10, "<module>", "df.collect()"),
+            ("/databricks/python/lib/python3.12/site-packages/IPython/core/interactiveshell.py", 3602, "run_code", "..."),
+            ("/databricks/python_shell/scripts/db_ipykernel_launcher.py", 48, "main", "..."),
+        ])
+        result = _find_trigger_line(
+            frames,
+            "/Workspace/Users/team@co.com/order_report"
+        )
+        assert result is not None
+        assert result["line"] == 10
+        assert "cellFingerprint" in result
+    finally:
+        _cell_source_cache.pop(cell_path, None)
 
 
 def test_find_trigger_line_exact_match():
@@ -332,8 +342,10 @@ def test_find_trigger_line_exact_match():
         ("/home/user/pipeline.py", 52, "main", "df.collect()"),
         ("/usr/lib/pyspark/sql/dataframe.py", 200, "collect", "..."),
     ])
-    line = _find_trigger_line(frames, "/home/user/pipeline.py")
-    assert line == 52  # innermost match
+    result = _find_trigger_line(frames, "/home/user/pipeline.py")
+    assert result is not None
+    assert result["line"] == 52  # innermost match
+    assert "cellFingerprint" not in result
 
 
 def test_find_trigger_line_basename_match():
@@ -341,30 +353,36 @@ def test_find_trigger_line_basename_match():
         ("/repo/src/pipelines/order_report.py", 30, "main", "df.write(...)"),
         ("/usr/lib/pyspark/sql/readwriter.py", 100, "save", "..."),
     ])
-    line = _find_trigger_line(
+    result = _find_trigger_line(
         frames,
         "/Workspace/Users/team@co.com/pipelines/order_report"
     )
-    assert line == 30
+    assert result is not None
+    assert result["line"] == 30
 
 
 def test_find_trigger_line_empty_frames():
-    line = _find_trigger_line(traceback.StackSummary.from_list([]), "/some/path.py")
-    assert line is None
+    result = _find_trigger_line(traceback.StackSummary.from_list([]), "/some/path.py")
+    assert result is None
 
 
-def test_extract_user_frames_databricks_normalized():
-    """Databricks cell frames should have filename normalized to source_path."""
-    frames = traceback.StackSummary.from_list([
-        ("/home/spark-UUID/.ipykernel/3322/command-123-456", 10, "<module>", "df.collect()"),
-        ("/databricks/python/lib/python3.12/site-packages/IPython/core/interactiveshell.py", 3602, "run_code", "..."),
-        ("/databricks/python_shell/scripts/db_ipykernel_launcher.py", 48, "main", "..."),
-    ])
-    source = "/Workspace/Users/team@co.com/order_report"
-    user_frames = _extract_user_frames(frames, source)
-    assert len(user_frames) == 1
-    assert user_frames[0]["file"] == source  # normalized
-    assert user_frames[0]["line"] == 10
+def test_extract_user_frames_databricks_fingerprinted():
+    """Databricks cell frames should get cellFingerprint, not file."""
+    cell_path = "/home/spark-UUID/.ipykernel/3322/command-123-456"
+    _cell_source_cache[cell_path] = "df.collect()\n"
+    try:
+        frames = traceback.StackSummary.from_list([
+            (cell_path, 10, "<module>", "df.collect()"),
+            ("/databricks/python/lib/python3.12/site-packages/IPython/core/interactiveshell.py", 3602, "run_code", "..."),
+            ("/databricks/python_shell/scripts/db_ipykernel_launcher.py", 48, "main", "..."),
+        ])
+        user_frames = _extract_user_frames(frames)
+        assert len(user_frames) == 1
+        assert "cellFingerprint" in user_frames[0]
+        assert "file" not in user_frames[0]
+        assert user_frames[0]["line"] == 10
+    finally:
+        _cell_source_cache.pop(cell_path, None)
 
 
 def test_extract_user_frames_local():
@@ -376,6 +394,7 @@ def test_extract_user_frames_local():
     user_frames = _extract_user_frames(frames)
     assert len(user_frames) == 1
     assert user_frames[0]["file"] == "/home/user/pipeline.py"
+    assert "cellFingerprint" not in user_frames[0]
 
 
 def test_extract_trigger_info_handles_traceback_failure():
@@ -477,16 +496,142 @@ def test_merge_line_dicts_empty():
     assert _merge_line_dicts({}, {}) == {}
 
 
-def test_serialize_construction_lines():
+def test_serialize_construction_lines_file_entries():
     lines = {"/path/a.py": {30, 10, 20}, "/path/b.py": {5}}
     serialized = serialize_construction_lines(lines)
-    assert serialized == {"/path/a.py": [10, 20, 30], "/path/b.py": [5]}
+    assert serialized == [
+        {"file": "/path/a.py", "lines": [10, 20, 30]},
+        {"file": "/path/b.py", "lines": [5]},
+    ]
 
 
 def test_serialize_construction_lines_skips_empty():
     lines = {"/path/a.py": set(), "/path/b.py": {5}}
     serialized = serialize_construction_lines(lines)
-    assert serialized == {"/path/b.py": [5]}
+    assert serialized == [{"file": "/path/b.py", "lines": [5]}]
+
+
+def test_serialize_construction_lines_databricks_cells():
+    """Databricks cell paths produce cellFingerprint entries via cache."""
+    import hashlib
+
+    source = "df = spark.sql('SELECT 1')\ndf.show()\n"
+    expected_fp = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+    cell_path = "/home/spark-UUID/.ipykernel/999/command-9876543210-123"
+
+    _cell_source_cache[cell_path] = source
+    try:
+        lines = {cell_path: {1, 2}}
+        serialized = serialize_construction_lines(lines)
+        assert len(serialized) == 1
+        assert serialized[0]["cellFingerprint"] == expected_fp
+        assert serialized[0]["lines"] == [1, 2]
+        assert "file" not in serialized[0]
+    finally:
+        _cell_source_cache.pop(cell_path, None)
+
+
+def test_serialize_construction_lines_mixed():
+    """Mix of cell paths and regular file paths."""
+    import hashlib
+
+    source = "cell source"
+    cell_path = "/home/spark-UUID/.ipykernel/999/command-111222333-444"
+
+    _cell_source_cache[cell_path] = source
+    try:
+        lines = {
+            cell_path: {5, 10},
+            "/home/user/utils.py": {42},
+        }
+        serialized = serialize_construction_lines(lines)
+        assert len(serialized) == 2
+        cell_entries = [e for e in serialized if "cellFingerprint" in e]
+        file_entries = [e for e in serialized if "file" in e]
+        assert len(cell_entries) == 1
+        assert len(file_entries) == 1
+        assert file_entries[0] == {"file": "/home/user/utils.py", "lines": [42]}
+    finally:
+        _cell_source_cache.pop(cell_path, None)
+
+
+def test_compute_cell_fingerprint_from_disk():
+    """Disk read still works as last resort (for local testing)."""
+    import hashlib
+    import tempfile
+
+    source = "orders = spark.table('orders')\n"
+    expected = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "command-555666777-888")
+    with open(path, "w") as f:
+        f.write(source)
+
+    try:
+        # Clear cache to force disk read
+        _cell_source_cache.pop(path, None)
+        assert compute_cell_fingerprint(path) == expected
+    finally:
+        os.unlink(path)
+        os.rmdir(tmpdir)
+
+
+def test_compute_cell_fingerprint_from_cache():
+    """Eagerly cached source should be used for fingerprinting."""
+    import hashlib
+
+    fake_path = "/home/spark-UUID/.ipykernel/999/command-111222333-444"
+    source = "df = spark.sql('SELECT 1')\n"
+    expected = hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
+
+    _cell_source_cache[fake_path] = source
+    try:
+        assert compute_cell_fingerprint(fake_path) == expected
+    finally:
+        _cell_source_cache.pop(fake_path, None)
+
+
+def test_compute_cell_fingerprint_missing_file():
+    fake_path = "/nonexistent/command-999888777-666"
+    _cell_source_cache.pop(fake_path, None)
+    assert compute_cell_fingerprint(fake_path) is None
+
+
+def test_ensure_cell_cached_from_linecache():
+    """_ensure_cell_cached should populate the cache from linecache."""
+    import linecache
+
+    fake_path = "/tmp/command-test-ensure-cached-12345"
+    source_lines = ["line one\n", "line two\n"]
+    # Manually inject into linecache (simulates what Databricks does)
+    linecache.cache[fake_path] = (
+        len("".join(source_lines)),
+        None,
+        source_lines,
+        fake_path,
+    )
+    _cell_source_cache.pop(fake_path, None)
+
+    try:
+        _ensure_cell_cached(fake_path)
+        assert fake_path in _cell_source_cache
+        assert _cell_source_cache[fake_path] == "line one\nline two\n"
+    finally:
+        _cell_source_cache.pop(fake_path, None)
+        linecache.cache.pop(fake_path, None)
+
+
+def test_ensure_cell_cached_idempotent():
+    """Second call shouldn't overwrite existing cache entry."""
+    fake_path = "/tmp/command-test-idempotent-99999"
+    _cell_source_cache[fake_path] = "original"
+
+    try:
+        _ensure_cell_cached(fake_path)
+        assert _cell_source_cache[fake_path] == "original"
+    finally:
+        _cell_source_cache.pop(fake_path, None)
 
 
 # ═══════════════════════════════════════════════════════════════════════

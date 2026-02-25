@@ -42,7 +42,7 @@ from .upload import upload_snapshot, upload_snapshot_urllib, UploadResult, Uploa
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
-VERSION = "0.3.15"
+VERSION = "0.3.18"
 
 
 class CYSnapshot:
@@ -209,6 +209,8 @@ class CYSnapshot:
             provenance = extract_trigger_info(self._source_path)
             if provenance.get("triggerLine") is not None:
                 entry["triggerLine"] = provenance["triggerLine"]
+            if provenance.get("triggerCellFingerprint"):
+                entry["triggerCellFingerprint"] = provenance["triggerCellFingerprint"]
             if provenance.get("triggerStack"):
                 entry["triggerStack"] = provenance["triggerStack"]
 
@@ -312,6 +314,8 @@ class CYSnapshot:
             entry["trigger"] = "manual.query"
             if provenance.get("triggerLine") is not None:
                 entry["triggerLine"] = provenance["triggerLine"]
+            if provenance.get("triggerCellFingerprint"):
+                entry["triggerCellFingerprint"] = provenance["triggerCellFingerprint"]
             if provenance.get("triggerStack"):
                 entry["triggerStack"] = provenance["triggerStack"]
             self._plans.append(entry)
@@ -332,6 +336,8 @@ class CYSnapshot:
             entry["trigger"] = "manual.df"
             if provenance.get("triggerLine") is not None:
                 entry["triggerLine"] = provenance["triggerLine"]
+            if provenance.get("triggerCellFingerprint"):
+                entry["triggerCellFingerprint"] = provenance["triggerCellFingerprint"]
             if provenance.get("triggerStack"):
                 entry["triggerStack"] = provenance["triggerStack"]
             # Read construction lines if accumulated on this DataFrame

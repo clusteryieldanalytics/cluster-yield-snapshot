@@ -26,6 +26,7 @@ known sourcePath so constructionLines is keyed by the notebook path.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import os
 import re
@@ -113,6 +114,71 @@ def _is_user_frame(filename: str) -> bool:
     if filename.startswith("<"):
         return False
     return not _is_internal_frame(filename)
+
+
+# Public alias for use by _capture.py
+is_databricks_cell_path = _is_databricks_cell_frame
+
+# Cache of cell source text, keyed by cell temp path.
+# Populated eagerly during frame walking (when linecache has the source).
+# Read at serialization time by compute_cell_fingerprint.
+_cell_source_cache: dict[str, str] = {}
+
+
+def _ensure_cell_cached(cell_path: str) -> None:
+    """
+    Eagerly cache a Databricks cell's source from linecache.
+
+    Called during frame walking (hot path) when we detect a cell frame.
+    linecache is fast — it's a dict lookup in CPython. The cell source
+    must be captured NOW because:
+      - The temp file doesn't exist on disk (compiled in memory)
+      - linecache entries may be evicted later
+      - By serialization time, the source may be gone
+    """
+    if cell_path in _cell_source_cache:
+        return
+    try:
+        import linecache
+        lines = linecache.getlines(cell_path)
+        if lines:
+            _cell_source_cache[cell_path] = "".join(lines)
+    except Exception:
+        pass
+
+
+def compute_cell_fingerprint(cell_path: str) -> Optional[str]:
+    """
+    Compute a SHA256 fingerprint of a Databricks cell's source.
+
+    Uses the eagerly cached source from _ensure_cell_cached (populated
+    during frame walking). Falls back to linecache and then disk read.
+
+    Returns the first 16 hex chars of the SHA256, or None if the
+    source can't be retrieved.
+    """
+    source = _cell_source_cache.get(cell_path)
+
+    if source is None:
+        # Fallback: try linecache directly
+        try:
+            import linecache
+            lines = linecache.getlines(cell_path)
+            if lines:
+                source = "".join(lines)
+                _cell_source_cache[cell_path] = source
+        except Exception:
+            pass
+
+    if source is None:
+        # Last resort: try disk (works for local testing)
+        try:
+            with open(cell_path, "r", encoding="utf-8") as f:
+                source = f.read()
+        except Exception:
+            return None
+
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
 
 
 def detect_source_path(spark: SparkSession) -> Optional[str]:
@@ -284,10 +350,13 @@ def _walk_frames(
         except AttributeError:
             break
 
-        # Priority 1: Databricks cell frame — normalize to source_path
+        # Priority 1: Databricks cell frame — keep raw path so
+        # serialize_construction_lines can group by cell and fingerprint.
+        # Eagerly cache the source from linecache NOW while the frame
+        # is alive — by serialization time, the source may be gone.
         if _is_databricks_cell_frame(fn):
-            key = source_path if source_path else fn
-            return (key, f.f_lineno)
+            _ensure_cell_cached(fn)
+            return (fn, f.f_lineno)
 
         # Priority 2: Exact match to source_path
         if source_path and fn == source_path:
@@ -321,8 +390,10 @@ def extract_trigger_info(
     the full user call chain.
 
     Returns a dict with:
-      - triggerLine: int or None — line number in the source file
+      - triggerLine: int or None — line number (cell-relative on Databricks)
+      - triggerCellFingerprint: str or None — only for Databricks cells
       - triggerStack: list[dict] — compact stack trace (user frames only)
+        Each entry has {line, function} plus either {file} or {cellFingerprint}
     """
     result: dict[str, Any] = {}
 
@@ -331,35 +402,40 @@ def extract_trigger_info(
     except Exception:
         return result
 
-    user_frames = _extract_user_frames(frames, source_path)
+    user_frames = _extract_user_frames(frames)
     if user_frames:
         result["triggerStack"] = user_frames
 
-    trigger_line = _find_trigger_line(frames, source_path)
-    if trigger_line is not None:
-        result["triggerLine"] = trigger_line
+    trigger = _find_trigger_line(frames, source_path)
+    if trigger is not None:
+        result["triggerLine"] = trigger["line"]
+        if "cellFingerprint" in trigger:
+            result["triggerCellFingerprint"] = trigger["cellFingerprint"]
 
     return result
 
 
 def _extract_user_frames(
     frames: traceback.StackSummary,
-    source_path: Optional[str] = None,
 ) -> list[dict[str, Any]]:
     """
     Filter stack frames to just user code, in compact format.
 
-    Databricks cell frames are included with their filename normalized
-    to source_path.
+    Databricks cell frames get a cellFingerprint (with source eagerly
+    cached). Regular user frames get a file path.
     """
     user_frames: list[dict[str, Any]] = []
     for frame in frames:
         if _is_databricks_cell_frame(frame.filename):
-            user_frames.append({
-                "file": source_path if source_path else frame.filename,
+            _ensure_cell_cached(frame.filename)
+            fp = compute_cell_fingerprint(frame.filename)
+            entry: dict[str, Any] = {
                 "line": frame.lineno,
                 "function": frame.name,
-            })
+            }
+            if fp:
+                entry["cellFingerprint"] = fp
+            user_frames.append(entry)
         elif _is_user_frame(frame.filename):
             user_frames.append({
                 "file": frame.filename,
@@ -372,11 +448,12 @@ def _extract_user_frames(
 def _find_trigger_line(
     frames: traceback.StackSummary,
     source_path: Optional[str],
-) -> Optional[int]:
+) -> Optional[dict[str, Any]]:
     """
-    Find the line number in the source file that triggered plan execution.
+    Find the trigger frame info.
 
-    Scans innermost-first for the best match.
+    Returns a dict with "line" and optionally "cellFingerprint",
+    or None if no match found.
     """
     if not frames:
         return None
@@ -389,17 +466,22 @@ def _find_trigger_line(
     for frame in reversed(frames):
         # Priority 1: Databricks cell frame
         if _is_databricks_cell_frame(frame.filename):
-            return frame.lineno
+            _ensure_cell_cached(frame.filename)
+            fp = compute_cell_fingerprint(frame.filename)
+            result: dict[str, Any] = {"line": frame.lineno}
+            if fp:
+                result["cellFingerprint"] = fp
+            return result
 
         # Priority 2: Exact match to source_path
         if source_path and frame.filename == source_path:
-            return frame.lineno
+            return {"line": frame.lineno}
 
         # Priority 3: Absolute path match
         if source_path:
             try:
                 if os.path.abspath(frame.filename) == os.path.abspath(source_path):
-                    return frame.lineno
+                    return {"line": frame.lineno}
             except (OSError, ValueError):
                 pass
 
@@ -407,11 +489,11 @@ def _find_trigger_line(
         if source_stem:
             frame_stem = os.path.splitext(os.path.basename(frame.filename))[0]
             if frame_stem == source_stem and not _is_internal_frame(frame.filename):
-                return frame.lineno
+                return {"line": frame.lineno}
 
     # Fallback: outermost user frame
     for frame in frames:
         if _is_user_frame(frame.filename):
-            return frame.lineno
+            return {"line": frame.lineno}
 
     return None
