@@ -6,12 +6,21 @@ DataFrameWriter methods to silently capture every physical plan
 that Spark produces during a session. The user's code runs
 completely unmodified.
 
+Additionally hooks DataFrame construction methods (.filter(), .join(),
+.select(), etc.) to track _cy_lines: a per-DataFrame dict mapping
+file paths to sets of line numbers that shaped the DataFrame. When an
+action fires, the accumulated _cy_lines become the plan's
+constructionLines — the set of source lines that, if changed in a PR,
+should trigger re-evaluation of this plan's cost.
+
 Safety contract:
   - Every hook is wrapped in try/except — our code NEVER breaks theirs
   - Original methods are stored and restored cleanly on stop()
   - Re-entrancy guard prevents our own internal Spark calls from
     being captured (e.g. DESCRIBE DETAIL for catalog stats)
   - All return values pass through untouched
+  - Construction line tracking is purely additive — if it fails for
+    any reason, the plan is still captured without lines
 """
 
 from __future__ import annotations
@@ -20,6 +29,8 @@ import functools
 import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, Optional
+
+from ._provenance import get_current_user_line
 
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
@@ -58,6 +69,83 @@ _WRITER_METHODS = (
     "text", "jdbc",
 )
 
+# ── Construction tracking ────────────────────────────────────────────────
+#
+# DataFrame methods that return a NEW DataFrame derived from self.
+# Each patched method propagates _cy_lines from self → result and
+# adds the current user code line.
+
+_CONSTRUCTION_METHODS = (
+    "filter", "where",
+    "select", "selectExpr",
+    "withColumn", "withColumnRenamed",
+    "drop",
+    "distinct", "dropDuplicates",
+    "orderBy", "sort",
+    "limit",
+    "sample",
+    "repartition", "coalesce",
+    "toDF",
+    "agg",
+)
+
+# DataFrame methods that merge TWO DataFrames — result gets the union
+# of both sides' _cy_lines plus the current line.
+_MERGE_METHODS = (
+    "join", "crossJoin",
+    "union", "unionAll", "unionByName",
+    "subtract", "intersect", "intersectAll", "exceptAll",
+)
+
+
+# ── _cy_lines helpers ────────────────────────────────────────────────────
+
+def _get_lines(df: Any) -> dict[str, set[int]]:
+    """Get _cy_lines from a DataFrame, or empty dict."""
+    return getattr(df, "_cy_lines", {})
+
+
+def _copy_lines(lines: dict[str, set[int]]) -> dict[str, set[int]]:
+    """Deep copy a construction lines dict."""
+    return {k: set(v) for k, v in lines.items()}
+
+
+def _set_lines(df: Any, lines: dict[str, set[int]]) -> None:
+    """Set _cy_lines on a DataFrame. Silently fails if object is frozen."""
+    try:
+        df._cy_lines = lines
+    except (AttributeError, TypeError):
+        pass  # Some DataFrame implementations may not allow dynamic attrs
+
+
+def _add_line(lines: dict[str, set[int]], filename: str, lineno: int) -> None:
+    """Add a (filename, lineno) pair to a construction lines dict in place."""
+    if filename in lines:
+        lines[filename].add(lineno)
+    else:
+        lines[filename] = {lineno}
+
+
+def _merge_line_dicts(
+    a: dict[str, set[int]],
+    b: dict[str, set[int]],
+) -> dict[str, set[int]]:
+    """Merge two construction line dicts. Returns a new dict."""
+    result = _copy_lines(a)
+    for k, v in b.items():
+        if k in result:
+            result[k] |= v
+        else:
+            result[k] = set(v)
+    return result
+
+
+def serialize_construction_lines(
+    lines: dict[str, set[int]],
+) -> dict[str, list[int]]:
+    """Convert _cy_lines to JSON-serializable format (sorted lists)."""
+    return {k: sorted(v) for k, v in lines.items() if v}
+
 
 class CapturedPlan:
     """A plan captured during passive observation."""
@@ -88,18 +176,29 @@ class PassiveCapture:
     Monkey-patches Spark to passively capture plans.
 
     Usage:
-        capture = PassiveCapture(spark, on_plan_captured=my_callback)
+        capture = PassiveCapture(spark, on_plan_captured=my_callback,
+                                 source_path="/path/to/notebook.py")
         capture.start()
         # ... user's code runs normally ...
         capture.stop()
 
     The callback fires for every captured plan with:
         (label, dataframe, sql_text_or_none, trigger)
+
+    Construction line tracking is automatic: each DataFrame accumulates
+    a _cy_lines dict recording which source lines shaped it. The
+    callback caller can read df._cy_lines to get the full line set.
     """
 
-    def __init__(self, spark: SparkSession, on_plan_captured: PlanCallback):
+    def __init__(
+        self,
+        spark: SparkSession,
+        on_plan_captured: PlanCallback,
+        source_path: Optional[str] = None,
+    ):
         self._spark = spark
         self._on_plan = on_plan_captured
+        self._source_path = source_path
         self._originals: dict[str, Any] = {}
         self._active = False
         self._counter = 0
@@ -131,6 +230,9 @@ class PassiveCapture:
         self._df_class = self._detect_dataframe_class()
         self._writer_class = self._detect_writer_class()
         self._patch_spark_sql()
+        self._patch_spark_table()
+        self._patch_construction_methods()
+        self._patch_merge_methods()
         self._patch_dataframe_actions()
         self._patch_writer_actions()
         self._active = True
@@ -148,7 +250,7 @@ class PassiveCapture:
     # ── Patching: spark.sql() ────────────────────────────────────────────
 
     def _patch_spark_sql(self) -> None:
-        """Patch SparkSession.sql to capture SQL queries."""
+        """Patch SparkSession.sql to capture SQL queries and seed _cy_lines."""
         session = self._spark
         original = session.sql
         self._originals["spark.sql"] = original
@@ -159,6 +261,8 @@ class PassiveCapture:
             df = original(sql_text, *args, **kwargs)
             if not capture._is_reentrant():
                 capture._on_sql_called(sql_text, df)
+                # Seed construction lines on the returned DataFrame
+                capture._seed_lines(df)
             return df
 
         session.sql = patched_sql
@@ -183,6 +287,131 @@ class PassiveCapture:
             pass  # Never break user code
         finally:
             self._exit_capture()
+
+    # ── Patching: spark.table() ──────────────────────────────────────────
+
+    def _patch_spark_table(self) -> None:
+        """Patch SparkSession.table to seed _cy_lines on reader DataFrames."""
+        session = self._spark
+        original = getattr(session, "table", None)
+        if original is None:
+            return
+        self._originals["spark.table"] = original
+        capture = self
+
+        @functools.wraps(original)
+        def patched_table(table_name: str, *args: Any, **kwargs: Any) -> DataFrame:
+            df = original(table_name, *args, **kwargs)
+            if not capture._is_reentrant():
+                capture._seed_lines(df)
+            return df
+
+        session.table = patched_table
+
+    # ── Patching: construction methods ───────────────────────────────────
+    #
+    # These methods return a new DataFrame derived from self. Each
+    # patched version propagates self._cy_lines to the result and adds
+    # the current user code line.
+
+    def _patch_construction_methods(self) -> None:
+        """Patch DataFrame transformation methods to track construction lines."""
+        DFClass = self._df_class
+        if DFClass is None:
+            return
+
+        for method_name in _CONSTRUCTION_METHODS:
+            original = getattr(DFClass, method_name, None)
+            if original is None:
+                continue
+            # Don't overwrite if we already patched this as an action
+            key = f"DataFrame.{method_name}"
+            if key in self._originals:
+                continue
+            self._originals[key] = original
+            self._install_construction_patch(DFClass, method_name, original)
+
+    def _install_construction_patch(
+        self, df_class: type, method_name: str, original: Any
+    ) -> None:
+        """Install a wrapper on a DataFrame construction method."""
+        capture = self
+
+        @functools.wraps(original)
+        def patched(df_self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original(df_self, *args, **kwargs)
+            try:
+                if capture._active:
+                    # Propagate _cy_lines from self → result, adding current line
+                    lines = _copy_lines(_get_lines(df_self))
+                    line_info = get_current_user_line(capture._source_path)
+                    if line_info:
+                        _add_line(lines, line_info[0], line_info[1])
+                    _set_lines(result, lines)
+            except Exception:
+                pass  # Never break user code
+            return result
+
+        setattr(df_class, method_name, patched)
+
+    # ── Patching: merge methods ──────────────────────────────────────────
+    #
+    # These methods merge two DataFrames. The result gets the union
+    # of both sides' _cy_lines.
+
+    def _patch_merge_methods(self) -> None:
+        """Patch DataFrame merge methods (.join, .union, etc.)."""
+        DFClass = self._df_class
+        if DFClass is None:
+            return
+
+        for method_name in _MERGE_METHODS:
+            original = getattr(DFClass, method_name, None)
+            if original is None:
+                continue
+            key = f"DataFrame.{method_name}"
+            if key in self._originals:
+                continue
+            self._originals[key] = original
+            self._install_merge_patch(DFClass, method_name, original)
+
+    def _install_merge_patch(
+        self, df_class: type, method_name: str, original: Any
+    ) -> None:
+        """Install a wrapper on a DataFrame merge method."""
+        capture = self
+
+        @functools.wraps(original)
+        def patched(df_self: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original(df_self, *args, **kwargs)
+            try:
+                if capture._active:
+                    # Merge _cy_lines from both sides
+                    left_lines = _get_lines(df_self)
+                    right_lines = _get_lines(args[0]) if args else {}
+                    merged = _merge_line_dicts(left_lines, right_lines)
+                    line_info = get_current_user_line(capture._source_path)
+                    if line_info:
+                        _add_line(merged, line_info[0], line_info[1])
+                    _set_lines(result, merged)
+            except Exception:
+                pass  # Never break user code
+            return result
+
+        setattr(df_class, method_name, patched)
+
+    # ── Seed _cy_lines on new DataFrames ─────────────────────────────────
+
+    def _seed_lines(self, df: Any) -> None:
+        """Seed _cy_lines on a DataFrame created by spark.sql/table/read."""
+        try:
+            lines: dict[str, set[int]] = {}
+            line_info = get_current_user_line(self._source_path)
+            if line_info:
+                _add_line(lines, line_info[0], line_info[1])
+            _set_lines(df, lines)
+        except Exception:
+            pass
 
     # ── Patching: DataFrame actions ──────────────────────────────────────
 
@@ -306,6 +535,8 @@ class PassiveCapture:
             try:
                 if key == "spark.sql":
                     self._spark.sql = original
+                elif key == "spark.table":
+                    self._spark.table = original
                 elif key.startswith("DataFrame."):
                     # Use the stored runtime class, not the import
                     cls = getattr(self, "_df_class", None)

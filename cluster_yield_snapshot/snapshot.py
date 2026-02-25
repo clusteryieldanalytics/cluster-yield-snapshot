@@ -33,7 +33,8 @@ from . import plans as _plans
 from . import catalog as _catalog
 from . import config as _config
 from . import environment as _env
-from ._capture import PassiveCapture
+from ._capture import PassiveCapture, serialize_construction_lines
+from ._provenance import detect_source_path, extract_trigger_info
 from .quick_scan import quick_scan
 from .formatting import print_summary, render_html
 from .upload import upload_snapshot, upload_snapshot_urllib, UploadResult, UploadError
@@ -99,6 +100,10 @@ class CYSnapshot:
         # Passive capture engine
         self._capture: Optional[PassiveCapture] = None
 
+        # Source provenance: the notebook/script path that produced
+        # this snapshot. Detected automatically at start() time.
+        self._source_path: Optional[str] = None
+
         # Track fingerprints to avoid storing duplicate plans.
         # Same query captured at spark.sql() time and again at action
         # time will have the same fingerprint if AQE didn't change it.
@@ -130,8 +135,22 @@ class CYSnapshot:
             self._log("Already capturing — ignoring duplicate start()")
             return self
 
-        self._capture = PassiveCapture(self._spark, self._on_plan_captured)
+        # Detect source path BEFORE creating PassiveCapture so the
+        # construction line patches can use it for efficient frame matching.
+        # Detection probes (spark.conf.get, inspect.stack) don't interfere
+        # with patching since patching hasn't started yet.
+        if self._source_path is None:
+            self._source_path = detect_source_path(self._spark)
+            if self._source_path and not self._quiet:
+                self._log(f"Source: {self._source_path}")
+
+        self._capture = PassiveCapture(
+            self._spark,
+            self._on_plan_captured,
+            source_path=self._source_path,
+        )
         self._capture.start()
+
         self._log("Passive capture started — all queries will be recorded")
         return self
 
@@ -184,6 +203,24 @@ class CYSnapshot:
             self._invalidate_cache()
             entry = _plans.capture_plan(df, label, sql=sql)
             entry["trigger"] = trigger
+
+            # ── Source provenance ─────────────────────────────────────
+            # Capture trigger line and stack from the action call site.
+            provenance = extract_trigger_info(self._source_path)
+            if provenance.get("triggerLine") is not None:
+                entry["triggerLine"] = provenance["triggerLine"]
+            if provenance.get("triggerStack"):
+                entry["triggerStack"] = provenance["triggerStack"]
+
+            # Read construction lines accumulated through the DataFrame
+            # transformation chain (filter, join, select, etc.).
+            # This is the full set of source lines that shaped this plan.
+            cy_lines = getattr(df, "_cy_lines", None)
+            if cy_lines:
+                entry["constructionLines"] = serialize_construction_lines(
+                    cy_lines
+                )
+
             nodes = entry.get("nodeCount", 0)
             fp = entry.get("fingerprint", "")
 
@@ -269,9 +306,14 @@ class CYSnapshot:
         """Manually capture the physical plan for a SQL query."""
         self._invalidate_cache()
         try:
+            provenance = extract_trigger_info(self._source_path)
             df = self._spark.sql(sql)
             entry = _plans.capture_plan(df, label, sql=sql)
             entry["trigger"] = "manual.query"
+            if provenance.get("triggerLine") is not None:
+                entry["triggerLine"] = provenance["triggerLine"]
+            if provenance.get("triggerStack"):
+                entry["triggerStack"] = provenance["triggerStack"]
             self._plans.append(entry)
             fp = entry.get("fingerprint", "")
             if fp and fp != "empty":
@@ -285,8 +327,19 @@ class CYSnapshot:
         """Manually capture the physical plan for an existing DataFrame."""
         self._invalidate_cache()
         try:
+            provenance = extract_trigger_info(self._source_path)
             entry = _plans.capture_plan(dataframe, label)
             entry["trigger"] = "manual.df"
+            if provenance.get("triggerLine") is not None:
+                entry["triggerLine"] = provenance["triggerLine"]
+            if provenance.get("triggerStack"):
+                entry["triggerStack"] = provenance["triggerStack"]
+            # Read construction lines if accumulated on this DataFrame
+            cy_lines = getattr(dataframe, "_cy_lines", None)
+            if cy_lines:
+                entry["constructionLines"] = serialize_construction_lines(
+                    cy_lines
+                )
             self._plans.append(entry)
             fp = entry.get("fingerprint", "")
             if fp and fp != "empty":
@@ -429,12 +482,16 @@ class CYSnapshot:
             self._record_error("catalog", table_name, e)
 
     def _build_snapshot(self) -> dict[str, Any]:
+        snapshot_meta: dict[str, Any] = {
+            "version": VERSION,
+            "capturedAt": self._captured_at,
+            "snapshotType": "environment",
+        }
+        if self._source_path:
+            snapshot_meta["sourcePath"] = self._source_path
+
         return {
-            "snapshot": {
-                "version": VERSION,
-                "capturedAt": self._captured_at,
-                "snapshotType": "environment",
-            },
+            "snapshot": snapshot_meta,
             "environment": _env.capture_environment(
                 self._spark, self._captured_at
             ),
