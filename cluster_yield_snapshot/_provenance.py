@@ -12,12 +12,23 @@ at CI time:
 
 These are captured automatically from the execution context. Zero
 user-facing changes.
+
+Databricks cell frame detection
+────────────────────────────────
+On Databricks, notebook cell code executes from a temp file like:
+  /home/spark-88da72a5-.../.ipykernel/3322/command-7650185192914251-931726307
+
+This path contains ".ipykernel/" which would match our internal frame
+markers. We detect these cell frames FIRST (via the "command-" basename)
+before checking internal markers, and normalize the filename to the
+known sourcePath so constructionLines is keyed by the notebook path.
 """
 
 from __future__ import annotations
 
 import inspect
 import os
+import re
 import sys
 import traceback
 from pathlib import PurePosixPath
@@ -28,9 +39,6 @@ if TYPE_CHECKING:
 
 
 # ── Source path detection ────────────────────────────────────────────────
-
-# Our own package directory — used to filter internal frames.
-_OWN_PACKAGE_DIR = str(PurePosixPath(__file__).parent)
 
 # Directories and path fragments that indicate internal frames
 # (not user code). Order doesn't matter — we check with `in`.
@@ -50,7 +58,61 @@ _INTERNAL_MARKERS = (
     "runpy.py",
     "threading.py",
     "<frozen ",
+    # Databricks infrastructure (NOT cell frames — those are handled
+    # separately by _is_databricks_cell_frame)
+    "/databricks/",
+    "python_shell/",
+    "db_ipykernel_launcher",
+    "db_driver_proxy",
+    "PythonShell",
+    # asyncio internals
+    "asyncio/",
+    # Tornado (Databricks kernel event loop)
+    "tornado/",
 )
+
+# Pattern for Databricks cell frame basenames.
+# Matches: command-7650185192914251-931726307
+_DATABRICKS_CELL_RE = re.compile(r"^command-\d+")
+
+
+def _is_databricks_cell_frame(filename: str) -> bool:
+    """
+    Return True if this frame is a Databricks notebook cell.
+
+    On Databricks, cell code runs from temp files like:
+      /home/spark-UUID/.ipykernel/PID/command-BIGNUM-BIGNUM
+
+    These must be detected BEFORE _is_internal_frame since the path
+    contains ".ipykernel/" which would match internal markers.
+    """
+    basename = os.path.basename(filename)
+    return bool(_DATABRICKS_CELL_RE.match(basename))
+
+
+def _is_internal_frame(filename: str) -> bool:
+    """Return True if the filename looks like an internal/framework frame."""
+    for marker in _INTERNAL_MARKERS:
+        if marker in filename:
+            return True
+    return False
+
+
+def _is_user_frame(filename: str) -> bool:
+    """
+    Return True if this frame is user code.
+
+    Checks in priority order:
+      1. Databricks cell frame → yes (even though path contains ipykernel)
+      2. Synthetic <...> frames → no (unless it's a cell frame)
+      3. Internal markers → no
+      4. Everything else → yes
+    """
+    if _is_databricks_cell_frame(filename):
+        return True
+    if filename.startswith("<"):
+        return False
+    return not _is_internal_frame(filename)
 
 
 def detect_source_path(spark: SparkSession) -> Optional[str]:
@@ -119,22 +181,19 @@ def _detect_caller_path() -> Optional[str]:
     best: Optional[str] = None
     for frame_info in reversed(stack):
         filename = frame_info.filename
-        if not filename or filename.startswith("<"):
+        if not filename:
             continue
-        if _is_internal_frame(filename):
+        if not _is_user_frame(filename):
+            continue
+        # Don't use Databricks cell temp paths as source path —
+        # those are meaningless outside the runtime. The Databricks
+        # path comes from spark config instead.
+        if _is_databricks_cell_frame(filename):
             continue
         if best is None:
             best = os.path.abspath(filename)
 
     return best
-
-
-def _is_internal_frame(filename: str) -> bool:
-    """Return True if the filename looks like an internal/framework frame."""
-    for marker in _INTERNAL_MARKERS:
-        if marker in filename:
-            return True
-    return False
 
 
 # ── Fast per-transformation line capture ─────────────────────────────────
@@ -155,11 +214,12 @@ def get_current_user_line(
 
     Args:
         source_path: The known source path (cached from start()).
-            Used for priority matching. If None, returns the first
-            non-internal frame.
+            Used as the normalized key when the actual frame filename
+            is a Databricks cell temp path.
 
     Returns:
         (filename, lineno) tuple, or None if no user frame found.
+        On Databricks, filename is normalized to source_path.
     """
     try:
         # Start 2 frames up: caller → patched method → this function
@@ -167,23 +227,23 @@ def get_current_user_line(
     except (ValueError, AttributeError):
         return None
 
-    # If we have a source_path, look for it specifically first
-    if source_path:
-        result = _walk_for_source(frame, source_path)
-        if result is not None:
-            return result
-
-    # Fallback: first non-internal frame
-    return _walk_for_any_user(frame)
+    return _walk_frames(frame, source_path)
 
 
-def _walk_for_source(
+def _walk_frames(
     frame: Any,
-    source_path: str,
+    source_path: Optional[str],
 ) -> Optional[Tuple[str, int]]:
-    """Walk frames looking for one matching source_path."""
-    source_basename = os.path.basename(source_path)
-    source_stem = os.path.splitext(source_basename)[0]
+    """
+    Walk frames to find the first user code frame.
+
+    On Databricks, the cell frame is recognized by its "command-*"
+    basename and the returned filename is normalized to source_path.
+    For local scripts, the actual filename is returned.
+    """
+    source_stem: Optional[str] = None
+    if source_path:
+        source_stem = os.path.splitext(os.path.basename(source_path))[0]
 
     f = frame
     while f is not None:
@@ -192,40 +252,23 @@ def _walk_for_source(
         except AttributeError:
             break
 
-        # Exact match
-        if fn == source_path:
+        # Priority 1: Databricks cell frame — normalize to source_path
+        if _is_databricks_cell_frame(fn):
+            key = source_path if source_path else fn
+            return (key, f.f_lineno)
+
+        # Priority 2: Exact match to source_path
+        if source_path and fn == source_path:
             return (fn, f.f_lineno)
 
-        # Basename/stem match (workspace path vs repo path)
+        # Priority 3: Basename/stem match (workspace vs repo paths)
         if source_stem:
             frame_stem = os.path.splitext(os.path.basename(fn))[0]
             if frame_stem == source_stem and not _is_internal_frame(fn):
                 return (fn, f.f_lineno)
 
-        # Databricks <command-N> frames
-        if (fn.startswith("<command")
-                and source_path.startswith(("/Workspace/", "/Repos/"))):
-            return (source_path, f.f_lineno)
-
-        f = f.f_back
-
-    return None
-
-
-def _walk_for_any_user(frame: Any) -> Optional[Tuple[str, int]]:
-    """Walk frames looking for the first non-internal frame."""
-    f = frame
-    while f is not None:
-        try:
-            fn = f.f_code.co_filename
-        except AttributeError:
-            break
-
+        # Priority 4: Any non-internal, non-synthetic frame
         if fn and not fn.startswith("<") and not _is_internal_frame(fn):
-            return (fn, f.f_lineno)
-
-        # Also accept Databricks <command-N> frames
-        if fn and fn.startswith("<command"):
             return (fn, f.f_lineno)
 
         f = f.f_back
@@ -256,7 +299,7 @@ def extract_trigger_info(
     except Exception:
         return result
 
-    user_frames = _extract_user_frames(frames)
+    user_frames = _extract_user_frames(frames, source_path)
     if user_frames:
         result["triggerStack"] = user_frames
 
@@ -269,19 +312,28 @@ def extract_trigger_info(
 
 def _extract_user_frames(
     frames: traceback.StackSummary,
+    source_path: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    """Filter stack frames to just user code, in compact format."""
+    """
+    Filter stack frames to just user code, in compact format.
+
+    Databricks cell frames are included with their filename normalized
+    to source_path.
+    """
     user_frames: list[dict[str, Any]] = []
     for frame in frames:
-        if _is_internal_frame(frame.filename):
-            continue
-        if frame.filename.startswith("<") and "command" not in frame.filename:
-            continue
-        user_frames.append({
-            "file": frame.filename,
-            "line": frame.lineno,
-            "function": frame.name,
-        })
+        if _is_databricks_cell_frame(frame.filename):
+            user_frames.append({
+                "file": source_path if source_path else frame.filename,
+                "line": frame.lineno,
+                "function": frame.name,
+            })
+        elif _is_user_frame(frame.filename):
+            user_frames.append({
+                "file": frame.filename,
+                "line": frame.lineno,
+                "function": frame.name,
+            })
     return user_frames
 
 
@@ -289,56 +341,45 @@ def _find_trigger_line(
     frames: traceback.StackSummary,
     source_path: Optional[str],
 ) -> Optional[int]:
-    """Find the line number in the source file that triggered plan execution."""
+    """
+    Find the line number in the source file that triggered plan execution.
+
+    Scans innermost-first for the best match.
+    """
     if not frames:
         return None
 
+    source_stem: Optional[str] = None
     if source_path:
-        match = _match_source_frame(frames, source_path)
-        if match is not None:
-            return match
+        source_stem = os.path.splitext(os.path.basename(source_path))[0]
+
+    # Scan innermost-first for the best match
+    for frame in reversed(frames):
+        # Priority 1: Databricks cell frame
+        if _is_databricks_cell_frame(frame.filename):
+            return frame.lineno
+
+        # Priority 2: Exact match to source_path
+        if source_path and frame.filename == source_path:
+            return frame.lineno
+
+        # Priority 3: Absolute path match
+        if source_path:
+            try:
+                if os.path.abspath(frame.filename) == os.path.abspath(source_path):
+                    return frame.lineno
+            except (OSError, ValueError):
+                pass
+
+        # Priority 4: Basename match
+        if source_stem:
+            frame_stem = os.path.splitext(os.path.basename(frame.filename))[0]
+            if frame_stem == source_stem and not _is_internal_frame(frame.filename):
+                return frame.lineno
 
     # Fallback: outermost user frame
-    outermost_line: Optional[int] = None
     for frame in frames:
-        if _is_internal_frame(frame.filename):
-            continue
-        if frame.filename.startswith("<") and "command" not in frame.filename:
-            continue
-        if outermost_line is None:
-            outermost_line = frame.lineno
-
-    return outermost_line
-
-
-def _match_source_frame(
-    frames: traceback.StackSummary,
-    source_path: str,
-) -> Optional[int]:
-    """Find the frame matching source_path, scanning innermost-first."""
-    source_basename = os.path.basename(source_path)
-    source_stem = os.path.splitext(source_basename)[0]
-
-    for frame in reversed(frames):
-        if _is_internal_frame(frame.filename):
-            continue
-
-        if frame.filename == source_path:
-            return frame.lineno
-
-        try:
-            if os.path.abspath(frame.filename) == os.path.abspath(source_path):
-                return frame.lineno
-        except (OSError, ValueError):
-            pass
-
-        frame_basename = os.path.basename(frame.filename)
-        frame_stem = os.path.splitext(frame_basename)[0]
-        if frame_stem and frame_stem == source_stem:
-            return frame.lineno
-
-        if (frame.filename.startswith("<command")
-                and source_path.startswith(("/Workspace/", "/Repos/"))):
+        if _is_user_frame(frame.filename):
             return frame.lineno
 
     return None
