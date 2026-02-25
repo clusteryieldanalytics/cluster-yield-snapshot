@@ -12,7 +12,8 @@ from cluster_yield_snapshot._provenance import (
     detect_source_path,
     extract_trigger_info,
     get_current_user_line,
-    _detect_databricks_path,
+    _detect_databricks_dbutils_path,
+    _detect_databricks_spark_conf_path,
     _detect_caller_path,
     _is_internal_frame,
     _is_databricks_cell_frame,
@@ -124,14 +125,43 @@ def test_is_user_frame_regular():
 # 3. Source path detection
 # ═══════════════════════════════════════════════════════════════════════
 
-def test_detect_databricks_path():
+def test_detect_databricks_dbutils_path():
+    """dbutils via IPython namespace — primary strategy on Databricks."""
+    mock_ip = MagicMock()
+    mock_ctx = MagicMock()
+    mock_ctx.notebookPath.return_value.get.return_value = (
+        "/Users/team@co.com/pipelines/order_report"
+    )
+    mock_dbutils = MagicMock()
+    mock_dbutils.notebook.entry_point.getDbutils.return_value \
+        .notebook.return_value.getContext.return_value = mock_ctx
+    mock_ip.user_ns = {"dbutils": mock_dbutils}
+
+    with patch("cluster_yield_snapshot._provenance._get_ipython", return_value=mock_ip):
+        path = _detect_databricks_dbutils_path()
+    assert path == "/Users/team@co.com/pipelines/order_report"
+
+
+def test_detect_databricks_dbutils_path_no_ipython():
+    with patch("cluster_yield_snapshot._provenance._get_ipython", return_value=None):
+        assert _detect_databricks_dbutils_path() is None
+
+
+def test_detect_databricks_dbutils_path_no_dbutils():
+    mock_ip = MagicMock()
+    mock_ip.user_ns = {}
+    with patch("cluster_yield_snapshot._provenance._get_ipython", return_value=mock_ip):
+        assert _detect_databricks_dbutils_path() is None
+
+
+def test_detect_databricks_spark_conf_path():
     spark = MagicMock()
-    spark.conf.get.return_value = "/Workspace/Users/team@co.com/pipelines/order_report"
-    path = _detect_databricks_path(spark)
-    assert path == "/Workspace/Users/team@co.com/pipelines/order_report"
+    spark.conf.get.return_value = "/Workspace/Users/team@co.com/nb"
+    path = _detect_databricks_spark_conf_path(spark)
+    assert path == "/Workspace/Users/team@co.com/nb"
 
 
-def test_detect_databricks_path_fallback():
+def test_detect_databricks_spark_conf_path_fallback():
     spark = MagicMock()
     call_count = {"n": 0}
     def side_effect(key):
@@ -140,32 +170,38 @@ def test_detect_databricks_path_fallback():
             raise Exception("not found")
         return "/Workspace/Users/team@co.com/order_report"
     spark.conf.get.side_effect = side_effect
-    path = _detect_databricks_path(spark)
+    path = _detect_databricks_spark_conf_path(spark)
     assert path == "/Workspace/Users/team@co.com/order_report"
 
 
-def test_detect_databricks_path_not_databricks():
+def test_detect_databricks_spark_conf_path_not_databricks():
     spark = MagicMock()
     spark.conf.get.side_effect = Exception("no config")
-    path = _detect_databricks_path(spark)
+    path = _detect_databricks_spark_conf_path(spark)
     assert path is None
 
 
-def test_detect_source_path_databricks_first():
+def test_detect_source_path_dbutils_first():
+    """dbutils should be tried before spark.conf."""
     spark = MagicMock()
-    spark.conf.get.return_value = "/Workspace/Users/team@co.com/nb"
-    path = detect_source_path(spark)
-    assert path == "/Workspace/Users/team@co.com/nb"
+    spark.conf.get.side_effect = Exception("blocked on Spark Connect")
+    with patch(
+        "cluster_yield_snapshot._provenance._detect_databricks_dbutils_path",
+        return_value="/Users/team@co.com/nb",
+    ):
+        path = detect_source_path(spark)
+    assert path == "/Users/team@co.com/nb"
 
 
 def test_detect_source_path_all_strategies_fail():
     spark = MagicMock()
     spark.conf.get.side_effect = Exception("not databricks")
-    with patch("cluster_yield_snapshot._provenance._detect_caller_path", return_value=None):
-        with patch("cluster_yield_snapshot._provenance.sys") as mock_sys:
-            mock_sys.argv = []
-            path = detect_source_path(spark)
-            assert path is None
+    with patch("cluster_yield_snapshot._provenance._detect_databricks_dbutils_path", return_value=None):
+        with patch("cluster_yield_snapshot._provenance._detect_caller_path", return_value=None):
+            with patch("cluster_yield_snapshot._provenance.sys") as mock_sys:
+                mock_sys.argv = []
+                path = detect_source_path(spark)
+                assert path is None
 
 
 # ═══════════════════════════════════════════════════════════════════════

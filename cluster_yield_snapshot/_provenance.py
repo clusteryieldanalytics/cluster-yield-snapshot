@@ -120,23 +120,29 @@ def detect_source_path(spark: SparkSession) -> Optional[str]:
     Detect the source notebook or script path.
 
     Detection order:
-      1. Databricks notebook path (from Spark config)
-      2. Caller's filename via inspect.stack()
-      3. sys.argv[0] as last resort
+      1. Databricks dbutils (via IPython namespace — works on Spark Connect)
+      2. Databricks Spark config (classic clusters only)
+      3. Caller's filename via inspect.stack()
+      4. sys.argv[0] as last resort
 
     Returns the path as a string, or None if detection fails.
     """
-    # Strategy 1: Databricks notebook path
-    path = _detect_databricks_path(spark)
+    # Strategy 1: Databricks dbutils (most reliable on Spark Connect)
+    path = _detect_databricks_dbutils_path()
     if path:
         return path
 
-    # Strategy 2: Walk the call stack to find the outermost user frame.
+    # Strategy 2: Databricks Spark config (classic clusters)
+    path = _detect_databricks_spark_conf_path(spark)
+    if path:
+        return path
+
+    # Strategy 3: Walk the call stack to find the outermost user frame.
     path = _detect_caller_path()
     if path:
         return path
 
-    # Strategy 3: sys.argv[0] (works for scripts invoked from CLI)
+    # Strategy 4: sys.argv[0] (works for scripts invoked from CLI)
     if sys.argv and sys.argv[0] and sys.argv[0] != "-c":
         argv_path = os.path.abspath(sys.argv[0])
         if os.path.isfile(argv_path):
@@ -145,24 +151,50 @@ def detect_source_path(spark: SparkSession) -> Optional[str]:
     return None
 
 
-def _detect_databricks_path(spark: SparkSession) -> Optional[str]:
-    """Try to get the notebook path from Databricks Spark config."""
+def _detect_databricks_dbutils_path() -> Optional[str]:
+    """
+    Get notebook path from dbutils via IPython namespace.
+
+    On Databricks, dbutils is injected into the notebook's IPython
+    namespace. This works on both classic and Spark Connect runtimes.
+    """
     try:
-        path = spark.conf.get("spark.databricks.notebook.path")
+        ip = _get_ipython()
+        if ip is None:
+            return None
+        dbutils = ip.user_ns.get("dbutils")
+        if dbutils is None:
+            return None
+        ctx = dbutils.notebook.entry_point.getDbutils().notebook().getContext()
+        path = ctx.notebookPath().get()
         if path:
             return path
     except Exception:
         pass
+    return None
 
+
+def _get_ipython():
+    """Get the IPython shell instance, or None if not in IPython."""
     try:
-        path = spark.conf.get(
-            "spark.databricks.clusterUsageTags.notebookPath"
-        )
-        if path:
-            return path
+        from IPython import get_ipython as _ipy_get
+        return _ipy_get()
     except Exception:
-        pass
+        return None
 
+
+def _detect_databricks_spark_conf_path(spark: SparkSession) -> Optional[str]:
+    """Try to get the notebook path from Databricks Spark config (classic only)."""
+    for key in (
+        "spark.databricks.notebook.path",
+        "spark.databricks.clusterUsageTags.notebookPath",
+    ):
+        try:
+            path = spark.conf.get(key)
+            if path:
+                return path
+        except Exception:
+            pass
     return None
 
 
