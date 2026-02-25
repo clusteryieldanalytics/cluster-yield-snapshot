@@ -42,7 +42,7 @@ from .upload import upload_snapshot, upload_snapshot_urllib, UploadResult, Uploa
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
-VERSION = "0.3.14"
+VERSION = "0.3.15"
 
 
 class CYSnapshot:
