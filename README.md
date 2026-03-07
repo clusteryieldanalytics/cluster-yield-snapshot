@@ -1,6 +1,6 @@
 # cluster-yield-snapshot
 
-Passive Spark plan capture for [Cluster Yield](https://clusteryield.com) analysis. Drop two lines into any notebook — no refactoring, no query registration, no code changes.
+Passive Spark plan capture for [Cluster Yield](https://clusteryield.app) analysis. Drop two lines into any notebook — no refactoring, no query registration, no code changes.
 
 Works on Databricks (serverless + classic), EMR, Dataproc, and open-source Spark.
 
