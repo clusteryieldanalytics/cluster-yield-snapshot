@@ -2,6 +2,8 @@
 
 Passive Spark plan capture for [Cluster Yield](https://clusteryield.app) analysis. Drop two lines into any notebook — no refactoring, no query registration, no code changes.
 
+Currently writes data to the cluster,  no upload is working.  
+
 Works on Databricks (serverless + classic), EMR, Dataproc, and open-source Spark.
 
 ## Install
@@ -63,7 +65,7 @@ When the same query is captured at both `spark.sql()` time and action time, the 
 | Spark config + drift | `sparkContext.getConf()` / `SET -v` |
 | Environment | Platform detection (Databricks / YARN / K8s) |
 
-## Upload to Cluster Yield
+## Upload to Cluster Yield -- COMING SOON
 
 The server analyzes on ingest — runs detectors, estimates costs, diffs against your last snapshot:
 
@@ -127,7 +129,7 @@ The capture hooks are read-only and wrapped in `try/except`:
 }
 ```
 
-Compatible with the Cluster Yield Scala analysis engine, the JVM `PlanCaptureListener`, and the `PlanExtractor` — the analyzer is agnostic to capture method.
+Intended to be used as part of a production monitoring solution in tandem with the Cluster Yield Analysis API.  
 
 ## Module structure
 
