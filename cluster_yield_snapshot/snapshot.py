@@ -42,7 +42,7 @@ from .upload import upload_snapshot, upload_snapshot_urllib, UploadResult, Uploa
 if TYPE_CHECKING:
     from pyspark.sql import DataFrame, SparkSession
 
-VERSION = "0.3.18"
+VERSION = "0.3.26"
 
 
 class CYSnapshot:
@@ -204,6 +204,12 @@ class CYSnapshot:
             entry = _plans.capture_plan(df, label, sql=sql)
             entry["trigger"] = trigger
 
+            nodes = entry.get("nodeCount", 0)
+            fp = entry.get("fingerprint", "")
+
+            self._log(f"  [debug] _on_plan_captured: label={label[:60]} "
+                      f"nodes={nodes} fp={fp[:8]} format={entry.get('planFormat', 'NONE')}")
+
             # ── Source provenance ─────────────────────────────────────
             # Capture trigger line and stack from the action call site.
             provenance = extract_trigger_info(self._source_path)
@@ -223,11 +229,9 @@ class CYSnapshot:
                     cy_lines
                 )
 
-            nodes = entry.get("nodeCount", 0)
-            fp = entry.get("fingerprint", "")
-
             # ── Filter: skip trivial plans ────────────────────────────
             if nodes < self._MIN_PLAN_NODES:
+                self._log(f"  [debug] Skipping trivial plan with {nodes}")
                 return
 
             # ── Filter: skip empty fingerprints (failed extraction) ───
@@ -261,6 +265,7 @@ class CYSnapshot:
                 return  # either upgraded or exact dup — don't add
 
             # Case 2: Same fingerprint
+            self._log(f"  [debug] fp={fp[:8]} sql_hash={sql_hash} trigger={trigger} label={label[:60]}")
             if fp in self._fingerprints:
                 idx = self._fingerprints[fp]
                 old_trigger = self._plans[idx].get("trigger", "")
@@ -279,11 +284,17 @@ class CYSnapshot:
                     return
 
                 # Same fingerprint, both from actions/writes.
-                # If they have different SQL text, they're different
-                # queries with the same plan shape → keep both.
-                # If neither has SQL (DF API chains) or same SQL → dedup.
+                # Different queries can produce the same operator sequence
+                # (e.g. two insertInto calls on different tables).
+                # Differentiate by SQL text OR by write target (label).
                 old_sql_hash = self._sql_hash(old_sql)
-                if sql_hash and old_sql_hash and sql_hash != old_sql_hash:
+                old_label = self._plans[idx].get("label", "")
+                has_different_sql = (sql_hash and old_sql_hash
+                                     and sql_hash != old_sql_hash)
+                has_different_target = (label != old_label
+                                        and ("write" in trigger
+                                             or "write" in old_trigger))
+                if has_different_sql or has_different_target:
                     pass  # Different queries, same shape → fall through to store
                 else:
                     # Same DF API chain executed twice, or cell re-run → skip
@@ -299,8 +310,11 @@ class CYSnapshot:
             mode = entry.get("planFormat", "?")
             self._log(f"  ✓ Captured '{label[:60]}' — "
                       f"{nodes} nodes [{mode}] ({trigger})")
-        except Exception:
-            pass  # Absolutely never break user code
+        except Exception as e:
+            try:
+                self._log(f"  ⚠ Plan capture failed: {type(e).__name__}: {e}")
+            except Exception:
+                pass  # Absolutely never break user code
 
     # ── Manual capture (still available) ─────────────────────────────────
 

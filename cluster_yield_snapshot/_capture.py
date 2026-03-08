@@ -266,6 +266,7 @@ class PassiveCapture:
         # Actual runtime classes (set during patching, used for restore)
         self._df_class: Optional[type] = None
         self._writer_class: Optional[type] = None
+        self._log_fn: Callable[[str], None] = lambda msg: print(f"[CY] {msg}")
 
     @property
     def active(self) -> bool:
@@ -520,12 +521,15 @@ class PassiveCapture:
         if WriterClass is None:
             return
 
+        self._log_fn(f"  [debug] Patching writer class: {WriterClass.__name__} ({WriterClass.__module__})")
         for method_name in _WRITER_METHODS:
             original = getattr(WriterClass, method_name, None)
             if original is None:
+                self._log_fn(f"  [debug] Writer method '{method_name}' not found — skipping")
                 continue
             self._originals[f"DataFrameWriter.{method_name}"] = original
             self._install_writer_patch(WriterClass, method_name, original)
+            self._log_fn(f"  [debug] Patched writer.{method_name}")
 
     def _install_writer_patch(
         self, writer_class: type, method_name: str, original: Any
@@ -541,7 +545,20 @@ class PassiveCapture:
 
             result = original(writer_self, *args, **kwargs)
 
-            if capture._active and not capture._is_reentrant() and source_df is not None:
+            if not capture._active:
+                return result
+
+            # Debug: confirm the patch is firing
+            try:
+                print(f"[CY]   [debug] writer.{method_name} fired — "
+                      f"active={capture._active} "
+                      f"reentrant={capture._is_reentrant()} "
+                      f"source_df={'yes' if source_df is not None else 'NO'} "
+                      f"writer_class={type(writer_self).__name__}")
+            except Exception:
+                pass
+
+            if not capture._is_reentrant() and source_df is not None:
                 capture._on_write_called(source_df, method_name, args)
             return result
 
@@ -552,6 +569,7 @@ class PassiveCapture:
     ) -> None:
         """Called after a DataFrameWriter method completes."""
         try:
+            print(f"[CY]   [debug] _on_write_called entered: method={method_name}")
             self._enter_capture()
             self._counter += 1
 
@@ -571,9 +589,14 @@ class PassiveCapture:
                 else:
                     label = f"write-{method_name}-{self._counter}"
 
+            print(f"[CY]   [debug] _on_write_called calling _on_plan: label={label[:60]}")
             self._on_plan(label, df, sql_text, f"write.{method_name}")
-        except Exception:
-            pass
+            print(f"[CY]   [debug] _on_write_called _on_plan returned")
+        except Exception as e:
+            try:
+                print(f"[CY]   [debug] _on_write_called failed: {type(e).__name__}: {e}")
+            except Exception:
+                pass
         finally:
             self._exit_capture()
 
