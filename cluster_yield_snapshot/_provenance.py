@@ -177,9 +177,14 @@ def compute_cell_fingerprint(cell_path: str) -> Optional[str]:
                 source = f.read()
         except Exception:
             return None
+        
+    source_normalized = normalize_cell_source(source)
+    return hashlib.sha256(source_normalized.encode("utf-8")).hexdigest()[:16]
 
-    return hashlib.sha256(source.encode("utf-8")).hexdigest()[:16]
-
+def normalize_cell_source(source: str) -> str:
+    """Strip leading/trailing blank lines and trailing whitespace per line."""
+    lines = source.strip("\n").splitlines(keepends=True)
+    return "".join(lines)
 
 def detect_source_path(spark: SparkSession) -> Optional[str]:
     """

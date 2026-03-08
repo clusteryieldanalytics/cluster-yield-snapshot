@@ -65,12 +65,12 @@ def capture_plan(df: DataFrame, label: str, sql: Optional[str] = None) -> dict[s
     plan_text = None
 
     # Strategy 1: JSON via JVM (classic PySpark)
-    raw = _compat.get_plan_json(df)
-    if raw is not None:
-        try:
-            plan_json = json.loads(raw) if isinstance(raw, str) else raw
-        except (json.JSONDecodeError, TypeError):
-            pass
+    # raw = _compat.get_plan_json(df)
+    # if raw is not None:
+    #    try:
+    #        plan_json = json.loads(raw) if isinstance(raw, str) else raw
+    #    except (json.JSONDecodeError, TypeError):
+    #        pass
 
     # Strategy 2: Text plan (works everywhere)
     plan_text = _compat.get_plan_text(df)
