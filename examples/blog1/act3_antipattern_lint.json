@@ -1,0 +1,41 @@
+{
+  "files_scanned": 1,
+  "total_findings": 1,
+  "exit_code": 2,
+  "counts": {
+    "info": 0,
+    "warning": 0,
+    "critical": 1
+  },
+  "findings": [
+    {
+      "rule_id": "CY014",
+      "severity": "critical",
+      "message": "DataFrame `result` has 2 terminal actions (.count(), .saveAsTable()) without .cache(). Each action recomputes the full lineage from source. Add .cache() before the first action, and .unpersist() when done.",
+      "filepath": "act3_antipattern.py",
+      "line": 301,
+      "col": 0,
+      "suggestion": null,
+      "cellFingerprint": "71a9dad5b336d1f6",
+      "cellLine": 21
+    }
+  ],
+  "errors": {},
+  "cellMaps": {
+    "act3_antipattern.py": {
+      "6c4fbcab8900fe2c": 2,
+      "aaf47cc9c5c0c60d": 5,
+      "ddcda03916a7b086": 9,
+      "727685f7b4757d0c": 14,
+      "1e4e1abd94111c72": 23,
+      "2af610f54d7be361": 97,
+      "e689840bc1b9ab3a": 111,
+      "61b81b55866cd8f3": 244,
+      "71a9dad5b336d1f6": 281,
+      "89f0b531d20f7851": 308,
+      "5fa2a4949bd271a2": 326,
+      "4b6add4907d5dad3": 364,
+      "491c2bf8e7cfa35c": 369
+    }
+  }
+}
