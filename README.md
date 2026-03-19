@@ -4,7 +4,7 @@ Passive Spark plan capture for [Cluster Yield](https://clusteryield.app) analysi
 
 Currently writes data to DBFS,  no upload is working.  
 
-Works on Databricks (serverless + classic), EMR, Dataproc, and open-source Spark.
+Works on Databricks (serverless + classic)
 
 ## Install
 
